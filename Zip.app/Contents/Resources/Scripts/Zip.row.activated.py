@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Zip.row.activated - double-click a row: ".." goes up, a folder drills in,
-a file opens in Quick Look."""
+a file refreshes the inline Quick Look preview."""
 import os
 import sys
 sys.path.insert(0, os.path.join(os.environ.get("OMC_APP_BUNDLE_PATH", ""),
@@ -17,7 +17,8 @@ if fullpath == "__UP__":
 elif isdir == "1":
     populate_level(fullpath)
 else:
-    # A file: mirror the selection so Quick Look acts on this row, then preview it.
+    # A file: make it the active selection and refresh the inline Quick Look pane.
+    enc = get_table_value(7)
     pb_set(PB_SEL_PATH, fullpath)
     pb_set(PB_SEL_ISDIR, isdir)
-    do_quicklook()
+    describe_and_preview(fullpath, isdir, enc)

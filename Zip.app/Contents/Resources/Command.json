@@ -175,11 +175,6 @@
     },
     {
       "NAME": "Zip",
-      "COMMAND_ID": "Zip.quicklook",
-      "EXECUTION_MODE": "exe_script_file"
-    },
-    {
-      "NAME": "Zip",
       "COMMAND_ID": "Zip.unlock",
       "EXECUTION_MODE": "exe_script_file"
     },

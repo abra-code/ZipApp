@@ -65,17 +65,6 @@
             }
           },
           {
-            "type": "Button",
-            "id": 35,
-            "properties": {
-              "title": "View",
-              "systemImage": "eye",
-              "actionID": "Zip.quicklook",
-              "disabled": true,
-              "help": "Quick Look the selected file"
-            }
-          },
-          {
             "type": "Menu",
             "id": 36,
             "properties": {
@@ -273,13 +262,10 @@
                 "properties": { "title": "Preview", "frame": { "maxWidth": "infinity", "maxHeight": "infinity" } },
                 "children": [
                   {
-                    "type": "TextEditor",
+                    "type": "QuickLook",
                     "id": 70,
                     "properties": {
-                      "readOnly": true,
-                      "font": { "size": 11, "design": "monospaced" },
-                      "background": "background.secondary",
-                      "scrollContentBackground": "hidden",
+                      "previewStyle": "compact",
                       "frame": { "minHeight": 160, "maxWidth": "infinity", "maxHeight": "infinity" }
                     }
                   }

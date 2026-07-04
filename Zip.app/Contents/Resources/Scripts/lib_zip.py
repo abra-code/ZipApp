@@ -34,7 +34,6 @@ PYTHON3 = os.path.join(APP_BUNDLE, "Contents/Library/Python/bin/python3")
 ZIPTOOL = os.path.join(APP_BUNDLE, "Contents/Resources/Scripts/ziptool.py")
 ARCHIVE_TOOL = os.path.join(APP_BUNDLE, "Contents/Helpers/archive")  # native libarchive helper (recrypt)
 FILE_TOOL = "/usr/bin/file"      # type detection + human-readable Kind
-QLMANAGE = "/usr/bin/qlmanage"   # Quick Look preview of an extracted entry
 
 # --- View IDs (match Zip.json) -------------------------------------------
 ID_TABLE = 10
@@ -42,7 +41,6 @@ ID_ADD_BTN = 31
 ID_DELETE_BTN = 32
 ID_EXTRACT_BTN = 33
 ID_EXTRACT_ALL_BTN = 34
-ID_QL_BTN = 35
 ID_LOCK_MENU = 36
 ID_UNLOCK = 37
 ID_ENCRYPT = 38
@@ -350,18 +348,6 @@ def clear_inspector():
     set_value(ID_DET_MOD, "-")
     set_value(ID_DET_ENC, "-")
     set_value(ID_PREVIEW, "")
-    enable_view(ID_QL_BTN, False)
-
-
-# Source/config formats that file(1) reports under application/* but are really text.
-TEXT_MIMES = {
-    "application/json", "application/xml", "application/javascript",
-    "application/x-sh", "application/x-shellscript", "application/x-csh",
-    "application/x-perl", "application/x-python", "application/x-python-code",
-    "application/x-ruby", "application/x-yaml", "application/x-yic",
-    "application/x-tex", "application/x-php", "application/x-httpd-php",
-    "application/toml", "application/x-ndjson", "application/sql",
-}
 
 
 def _file_describe(buf):
@@ -379,46 +365,76 @@ def _file_describe(buf):
     return (mime, desc)
 
 
-def _is_text_mime(mime):
-    return mime.startswith("text/") or mime in TEXT_MIMES
+def extract_for_preview(entry, pw):
+    """Quietly extract a single file entry to the per-document preview scratch
+    dir and return the extracted file path, or None on failure. Only the current
+    preview is ever held (the dir is wiped first). Unlike do_extract this shows
+    no progress/toast and never triggers the password prompt - it is safe to call
+    on every selection change to feed the inline Quick Look pane."""
+    arc = active_archive()
+    if not arc:
+        return None
+    pdir = preview_dir()
+    shutil.rmtree(pdir, ignore_errors=True)   # only ever hold the current preview
+    os.makedirs(pdir, exist_ok=True)
+    rf = tempfile.NamedTemporaryFile(prefix="zipql-", delete=False)
+    rf_path = rf.name
+    rf.close()
+    args = ["extract", arc, "--dest", pdir, "--entry", entry, "--result-file", rf_path]
+    if pw:
+        args.append("--pwd-stdin")
+    r = run_ziptool(*args, stdin=(pw or None))
+    root = None
+    try:
+        with open(rf_path, "r", encoding="utf-8") as f:
+            parts = f.read().strip().split("\t")
+        if len(parts) == 2 and parts[0].isdigit():
+            root = parts[1]
+    except OSError:
+        pass
+    finally:
+        try:
+            os.remove(rf_path)
+        except OSError:
+            pass
+    if r.returncode == 0 and root and os.path.exists(root):
+        return root
+    return None
 
 
 def describe_and_preview(fullpath, isdir, enc):
-    """Set the Kind detail row + inline preview, and enable Quick Look for files.
+    """Set the Kind detail row and feed the inline native Quick Look pane.
 
-    Detection is content-based via file(1) on a capped in-memory prefix read
-    straight from the archive (no temp file) - so extensionless text such as
-    README/Makefile/LICENSE previews, and binaries are named, not guessed.
+    The selected entry is extracted on demand to a per-document scratch dir and
+    handed to the QuickLook view (ID_PREVIEW) by file path. Kind is detected
+    content-based via file(1) on the extracted bytes - so extensionless text such
+    as README/Makefile/LICENSE is named, not guessed. Folders, and encrypted
+    entries before the session password is known, clear the pane.
     """
-    enable_view(ID_QL_BTN, isdir != "1")   # Quick Look applies to real files
     if isdir == "1":
         set_value(ID_DET_KIND, "Folder")
-        set_value(ID_PREVIEW, "(folder)")
+        set_value(ID_PREVIEW, "")
         return
-    # Encrypted entries preview inline once the session password is known (the
-    # read is routed through ziptool, which uses the libarchive helper for AES).
+    # Encrypted entries preview once the session password is known.
     pw = pb_get(PB_PASSWORD)
     if enc == "1" and not pw:
         set_value(ID_DET_KIND, "Encrypted")
-        set_value(ID_PREVIEW, "(encrypted - unlock to preview)")
+        set_value(ID_PREVIEW, "")
         return
-    read_args = ["read", active_archive(), "--entry", fullpath, "--max", "8192"]
-    if pw:
-        read_args.append("--pwd-stdin")
-    r = run_ziptool(*read_args, stdin=(pw or None))
-    if enc == "1" and r.returncode == 2:
-        set_value(ID_DET_KIND, "Encrypted")
-        set_value(ID_PREVIEW, "(encrypted - wrong password?)")
+    path = extract_for_preview(fullpath, pw)
+    if not path:
+        # Extraction failed - on an encrypted entry this means a wrong password.
+        set_value(ID_DET_KIND, "Encrypted" if enc == "1" else "-")
+        set_value(ID_PREVIEW, "")
         return
-    buf = r.stdout or b""
-    mime, desc = _file_describe(buf)
+    try:
+        with open(path, "rb") as f:
+            head = f.read(8192)
+    except OSError:
+        head = b""
+    mime, desc = _file_describe(head)
     set_value(ID_DET_KIND, desc or mime or "-")
-    if not buf or mime == "inode/x-empty":
-        set_value(ID_PREVIEW, "(empty file)")
-    elif _is_text_mime(mime):
-        set_value(ID_PREVIEW, buf.decode("utf-8", "replace"))
-    else:
-        set_value(ID_PREVIEW, "(%s - use Quick Look to view)" % (mime or "binary file"))
+    set_value(ID_PREVIEW, path)
 
 
 # --- Loading / creating documents ----------------------------------------
@@ -618,7 +634,7 @@ def do_extract():
         subprocess.run([NEXT_CMD, CMD_GUID, "Zip.password.prompt"], capture_output=True)
         return
 
-    set_status("Preparing Quick Look..." if mode == "quicklook" else "Extracting...")
+    set_status("Extracting...")
     if pw:
         args.append("--pwd-stdin")
     # ziptool streams "file N of M" progress lines to stdout (parsed live by OMC's
@@ -645,24 +661,20 @@ def do_extract():
         except OSError:
             pass
     if rc == 0:
-        if mode == "quicklook":
-            set_status("Quick Look: %s" % os.path.basename(root))
-            subprocess.run([QLMANAGE, "-p", root], capture_output=True)
+        if mode == "all":
+            base = os.path.basename(arc)
+            intended = base[:-4] if base.lower().endswith(".zip") else base
         else:
-            if mode == "all":
-                base = os.path.basename(arc)
-                intended = base[:-4] if base.lower().endswith(".zip") else base
-            else:
-                intended = os.path.basename(pb_get(PB_SEL_PATH).rstrip("/"))
-            msg = "Extracted %d item%s to %s" % (count, "" if count == 1 else "s", root)
-            if os.path.basename(root) != intended:
-                msg += "  (renamed to avoid overwriting)"
-            set_status(msg)
-            # Transient toast acknowledges the quick action and offers Reveal; no
-            # notification (that is for background work the user has looked away from).
-            pb_set(PB_EX_LAST, root)
-            toast = "Extracted %d item%s" % (count, "" if count == 1 else "s")
-            present_toast(toast, 6, "Show in Finder", "Zip.reveal")
+            intended = os.path.basename(pb_get(PB_SEL_PATH).rstrip("/"))
+        msg = "Extracted %d item%s to %s" % (count, "" if count == 1 else "s", root)
+        if os.path.basename(root) != intended:
+            msg += "  (renamed to avoid overwriting)"
+        set_status(msg)
+        # Transient toast acknowledges the quick action and offers Reveal; no
+        # notification (that is for background work the user has looked away from).
+        pb_set(PB_EX_LAST, root)
+        toast = "Extracted %d item%s" % (count, "" if count == 1 else "s")
+        present_toast(toast, 6, "Show in Finder", "Zip.reveal")
     elif rc == 2:
         pb_set(PB_PASSWORD, "")
         set_status("Incorrect password.")
@@ -673,22 +685,6 @@ def do_extract():
     else:
         alert("Extraction failed. See log for details.", level="caution")
         set_status("Extraction failed.")
-
-
-# --- Quick Look -----------------------------------------------------------
-def do_quicklook():
-    """Extract the selected file entry to the document's preview scratch dir and
-    open it in Quick Look (qlmanage -p). Reuses do_extract so the encrypted
-    password chain (and AES rejection) is shared."""
-    sel = pb_get(PB_SEL_PATH)
-    if not sel or pb_get(PB_SEL_ISDIR) == "1":
-        return
-    pdir = preview_dir()
-    shutil.rmtree(pdir, ignore_errors=True)   # only ever hold the current preview
-    os.makedirs(pdir, exist_ok=True)
-    pb_set(PB_EX_DEST, pdir)
-    pb_set(PB_EX_MODE, "quicklook")
-    do_extract()
 
 
 # --- Encryption (unlock / encrypt / change password / remove) -------------
