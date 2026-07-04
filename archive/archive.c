@@ -104,6 +104,50 @@ static int name_eq(const char *a, const char *b)
     return la == lb && strncmp(a, b, la) == 0;
 }
 
+/* macOS metadata noise that is junk by NAME alone: the __MACOSX sidecar tree
+ * (an archive-only convention, junk wholesale) and .DS_Store. "._*" names are
+ * handled separately - only files carrying the AppleDouble magic are junk;
+ * a user file that happens to be named "._foo" is real content. */
+static int is_name_junk(const char *raw)
+{
+    const char *name = norm(raw);
+    if (strncmp(name, "__MACOSX", 8) == 0 && (name[8] == '\0' || name[8] == '/'))
+        return 1;
+    size_t len = strlen(name);
+    while (len > 0 && name[len - 1] == '/') len--;
+    size_t start = len;
+    while (start > 0 && name[start - 1] != '/') start--;
+    size_t blen = len - start;
+    if (blen == 9 && strncmp(name + start, ".DS_Store", 9) == 0)
+        return 1;
+    return 0;
+}
+
+/* AppleDouble magic (version 2): 0x00 0x05 0x16 0x07. */
+static const unsigned char AD_MAGIC[4] = { 0x00, 0x05, 0x16, 0x07 };
+
+/* True when the basename starts with "._" (outside __MACOSX, which is already
+ * junk by name). Such an entry is only a CANDIDATE - the AppleDouble magic in
+ * its first bytes decides. */
+static int is_dot_underscore(const char *raw)
+{
+    const char *name = norm(raw);
+    if (strncmp(name, "__MACOSX", 8) == 0 && (name[8] == '\0' || name[8] == '/'))
+        return 0;
+    size_t len = strlen(name);
+    while (len > 0 && name[len - 1] == '/') len--;
+    size_t start = len;
+    while (start > 0 && name[start - 1] != '/') start--;
+    return (len - start) >= 2 && name[start] == '.' && name[start + 1] == '_';
+}
+
+/* True when <name> (normalized) starts with <prefix>; NULL prefix matches all. */
+static int prefix_match(const char *name, const char *prefix)
+{
+    if (prefix == NULL) return 1;
+    return strncmp(norm(name), prefix, strlen(prefix)) == 0;
+}
+
 /* Distinguish a wrong/missing passphrase from other libarchive failures. */
 static int is_passphrase_error(struct archive *a)
 {
@@ -196,7 +240,8 @@ static int member_wanted(const char *name, int memberc, char **memberv)
     return 0;
 }
 
-static int cmd_extract(const char *path, const char *destdir, int memberc, char **memberv, const char *pass)
+static int cmd_extract(const char *path, const char *destdir, int memberc, char **memberv,
+                       const char *prefix, int skip_junk, int progress, const char *pass)
 {
     /* Open the archive before chdir so a relative <archive> still resolves
      * against the original cwd; the open fd survives the chdir below. */
@@ -218,13 +263,42 @@ static int cmd_extract(const char *path, const char *destdir, int memberc, char 
     struct archive_entry *e;
     int rc = 0, r, count = 0;
     while ((r = archive_read_next_header(a, &e)) == ARCHIVE_OK) {
-        if (!member_wanted(archive_entry_pathname(e), memberc, memberv))
+        const char *pathname = archive_entry_pathname(e);
+        if (!member_wanted(pathname, memberc, memberv))
             continue;
+        if (!prefix_match(pathname, prefix))
+            continue;
+        if (skip_junk && is_name_junk(pathname))
+            continue;
+        /* "._*" files: peek the first data block and skip only true AppleDouble
+         * sidecars (magic 00 05 16 07); a user file merely named "._foo" is
+         * extracted. The peeked block is written after the header below. The
+         * passphrase (if any) is active here, so encrypted entries peek fine. */
+        int peeked = 0; const void *pbuff = NULL; size_t psize = 0; la_int64_t poffset = 0;
+        if (skip_junk && S_ISREG(archive_entry_filetype(e)) && is_dot_underscore(pathname)) {
+            int pr = archive_read_data_block(a, &pbuff, &psize, &poffset);
+            if (pr == ARCHIVE_OK) {
+                peeked = 1;
+                if (psize >= sizeof AD_MAGIC && memcmp(pbuff, AD_MAGIC, sizeof AD_MAGIC) == 0)
+                    continue;   /* true AppleDouble: junk (rest auto-skipped by next_header) */
+            } else if (pr != ARCHIVE_EOF) {   /* EOF = empty file: keep it */
+                rc = is_passphrase_error(a) ? 2 : 1;
+                fprintf(stderr, "archive: extract error: %s\n", archive_error_string(a));
+                break;
+            }
+        }
         if (archive_write_header(ext, e) != ARCHIVE_OK) {
             fprintf(stderr, "archive: write header: %s\n", archive_error_string(ext));
             continue;
         }
+        /* Regular files carry data; symlinks and directories are fully described
+         * by the header (the zip reader resolves symlink targets on open). */
         if (S_ISREG(archive_entry_filetype(e))) {
+            if (peeked && archive_write_data_block(ext, pbuff, psize, poffset) < ARCHIVE_OK) {
+                rc = 1;
+                fprintf(stderr, "archive: write data: %s\n", archive_error_string(ext));
+                break;
+            }
             if (copy_data(a, ext) < ARCHIVE_OK) {
                 rc = is_passphrase_error(a) ? 2 : 1;
                 fprintf(stderr, "archive: extract error: %s\n", archive_error_string(a));
@@ -232,6 +306,14 @@ static int cmd_extract(const char *path, const char *destdir, int memberc, char 
             }
         }
         archive_write_finish_entry(ext);
+        /* One stdout line per extracted file/symlink (dirs excluded) so the
+         * caller can turn the stream into live progress. The line carries only
+         * the running number - entry names could contain newlines and corrupt
+         * the line-per-file contract. */
+        if (progress && !S_ISDIR(archive_entry_filetype(e))) {
+            printf("%d\n", count + 1);
+            fflush(stdout);
+        }
         count++;
     }
     if (r < ARCHIVE_OK && r != ARCHIVE_EOF && rc == 0)
@@ -249,10 +331,11 @@ static int cmd_extract(const char *path, const char *destdir, int memberc, char 
 
 /* ---- list: one TSV line per entry (no passphrase needed) ------------------ */
 
-/* Emits: pathname<TAB>isdir<TAB>size<TAB>mtime<TAB>enc
+/* Emits: pathname<TAB>isdir<TAB>size<TAB>mtime<TAB>enc<TAB>ad
  * mtime is "YYYY-MM-DD HH:MM" (local) or empty; enc is 1 if the entry is
- * encrypted. The zip central directory (names/sizes/flags) is not encrypted, so
- * this works without a password. */
+ * encrypted; ad is 1 for a "._*" file confirmed (or, when encrypted,
+ * presumed) to be an AppleDouble sidecar. The zip central directory
+ * (names/sizes/flags) is not encrypted, so this works without a password. */
 static int cmd_list(const char *path)
 {
     struct archive *a = archive_read_new();
@@ -282,7 +365,21 @@ static int cmd_list(const char *path)
                 strftime(tbuf, sizeof tbuf, "%Y-%m-%d %H:%M", &tmv);
         }
         int enc = archive_entry_is_encrypted(e) ? 1 : 0;
-        printf("%s\t%d\t%lld\t%s\t%d\n", name, isdir, size, tbuf, enc);
+        /* ad: 1 when a "._*" regular file is a (confirmed or presumed)
+         * AppleDouble sidecar. Unencrypted candidates are peeked for the magic;
+         * encrypted ones cannot be read without a password here, so they keep
+         * the name-based presumption. 0 for everything else. */
+        int ad = 0;
+        if (!isdir && S_ISREG(archive_entry_filetype(e)) && is_dot_underscore(name)) {
+            if (enc) {
+                ad = 1;
+            } else {
+                unsigned char m[sizeof AD_MAGIC];
+                la_ssize_t n = archive_read_data(a, m, sizeof m);
+                ad = (n == (la_ssize_t)sizeof m && memcmp(m, AD_MAGIC, sizeof m) == 0) ? 1 : 0;
+            }
+        }
+        printf("%s\t%d\t%lld\t%s\t%d\t%d\n", name, isdir, size, tbuf, enc, ad);
     }
     if (r < ARCHIVE_OK && r != ARCHIVE_EOF) {
         fprintf(stderr, "archive: list error: %s\n", archive_error_string(a));
@@ -400,12 +497,27 @@ static int cmd_create(const char *dst, const char *manifest, const char *mode, c
         const char *arcname = line;
         const char *srcpath = tab + 1;
 
+        /* lstat, not stat: a symlink must be archived as a symlink entry, never
+         * silently replaced by its target (duplicated framework binaries broke
+         * code signatures: "unsealed contents" on extraction). */
         struct stat st;
-        if (stat(srcpath, &st) != 0) { fprintf(stderr, "archive: cannot stat %s\n", srcpath); rc = 1; break; }
+        if (lstat(srcpath, &st) != 0) { fprintf(stderr, "archive: cannot stat %s\n", srcpath); rc = 1; break; }
 
         struct archive_entry *e = archive_entry_new();
         archive_entry_set_pathname(e, arcname);
         archive_entry_copy_stat(e, &st);
+        if (S_ISLNK(st.st_mode)) {
+            char target[4096];
+            ssize_t tl = readlink(srcpath, target, sizeof target - 1);
+            if (tl < 0 || tl >= (ssize_t)(sizeof target - 1)) {
+                /* error, or target possibly truncated - storing a wrong link
+                 * target silently would corrupt the archive's content */
+                fprintf(stderr, "archive: cannot readlink %s\n", srcpath);
+                archive_entry_free(e); rc = 1; break;
+            }
+            target[tl] = '\0';
+            archive_entry_set_symlink(e, target);
+        }
         if (archive_write_header(w, e) != ARCHIVE_OK) {
             fprintf(stderr, "archive: write header: %s\n", archive_error_string(w));
             archive_entry_free(e); rc = 1; break;
@@ -440,8 +552,11 @@ static int usage(void)
     fprintf(stderr,
         "usage (passphrases always arrive on stdin, never on argv):\n"
         "  archive read    <archive> <entry> [--max BYTES]      # entry -> stdout\n"
-        "  archive extract <archive> <destdir> [member ...]     # extract all or listed members\n"
-        "  archive list    <archive>                            # TSV path<TAB>isdir<TAB>size<TAB>mtime<TAB>enc (no password)\n"
+        "  archive extract <archive> <destdir> [member ...] [--prefix P] [--skip-junk] [--progress]\n"
+        "                                                       # extract all, listed members, or entries under P;\n"
+        "                                                       # --skip-junk drops __MACOSX/._*/.DS_Store;\n"
+        "                                                       # --progress prints one line per extracted file\n"
+        "  archive list    <archive>                            # TSV path<TAB>isdir<TAB>size<TAB>mtime<TAB>enc<TAB>ad (no password)\n"
         "  archive create  <dest.zip> [--manifest <file>] [--encrypt aes256|zipcrypt]\n"
         "                                                       # build zip from 'arcname<TAB>srcpath' lines (empty if no manifest)\n"
         "  archive recrypt <src> <dest.zip> --mode aes256|zipcrypt|none [--old-pwd-stdin] [--new-pwd-stdin]\n"
@@ -479,8 +594,19 @@ int main(int argc, char **argv)
         free(pass);
     } else if (strcmp(cmd, "extract") == 0) {
         if (argc < 4) { free(sbuf); return usage(); }
+        /* Split trailing args into flags and member names. */
+        const char *prefix = NULL;
+        int skip_junk = 0, progress = 0;
+        char *members[argc];
+        int memberc = 0;
+        for (int i = 4; i < argc; i++) {
+            if (strcmp(argv[i], "--prefix") == 0 && i + 1 < argc) prefix = argv[++i];
+            else if (strcmp(argv[i], "--skip-junk") == 0) skip_junk = 1;
+            else if (strcmp(argv[i], "--progress") == 0) progress = 1;
+            else members[memberc++] = argv[i];
+        }
         char *pass = dup_stripped(sbuf, slen);
-        rc = cmd_extract(argv[2], argv[3], argc - 4, argv + 4, pass);
+        rc = cmd_extract(argv[2], argv[3], memberc, members, prefix, skip_junk, progress, pass);
         free(pass);
     } else if (strcmp(cmd, "create") == 0) {
         const char *manifest = NULL, *mode = "none";

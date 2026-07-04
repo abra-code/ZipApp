@@ -73,9 +73,10 @@ def _archive_read(archive, entry, maxbytes, pwd):
 
 
 def _archive_list(archive):
-    """Run the helper's `list`; return rows [(path, isdir, size, mtime, enc)] or
-    None on error. Encryption is a boolean (libarchive does not expose the cipher);
-    names/sizes/mtime/enc are readable without a password."""
+    """Run the helper's `list`; return rows [(path, isdir, size, mtime, enc, ad)]
+    or None on error. Encryption is a boolean (libarchive does not expose the
+    cipher); ad is "1" for a "._*" file confirmed (or, when encrypted, presumed)
+    to be an AppleDouble sidecar. Readable without a password."""
     r = subprocess.run([ARCHIVE_BIN, "list", archive], input=b"", capture_output=True)
     if r.returncode != 0:
         if r.stderr:
@@ -86,23 +87,36 @@ def _archive_list(archive):
         if not line:
             continue
         parts = line.split("\t")
-        if len(parts) < 5:
-            parts += [""] * (5 - len(parts))
-        rows.append(parts[:5])
+        if len(parts) < 6:
+            parts += [""] * (6 - len(parts))
+        # Normalize a leading "./" here, at the single entry point of archive
+        # names into the model, so matching/counting agrees with the helper's
+        # norm()-based comparisons for bsdtar-style "./name" archives.
+        if parts[0].startswith("./"):
+            parts[0] = parts[0][2:]
+        rows.append(parts[:6])
     return rows
 
 
 # --------------------------------------------------------------------------- helpers
 
-def is_junk(name):
-    """macOS resource-fork / metadata noise we hide from the listing."""
-    if name.startswith("__MACOSX/") or name == "__MACOSX/":
+def is_junk(name, appledouble="1"):
+    """macOS metadata noise we hide from the listing. Mirrors the helper's
+    junk rules exactly (leading './' normalized, bare __MACOSX matched) so
+    progress totals line up with what it extracts. A "._*" name alone is only
+    a candidate: the helper's list peeks for the AppleDouble magic and reports
+    it in the ad column, passed here as `appledouble` - a user file genuinely
+    named "._foo" is real content, not junk. Callers without the flag keep the
+    conservative name-based behavior."""
+    if name.startswith("./"):
+        name = name[2:]
+    if name == "__MACOSX" or name == "__MACOSX/" or name.startswith("__MACOSX/"):
         return True
     base = name.rstrip("/").rsplit("/", 1)[-1]
     if base == ".DS_Store":
         return True
     if base.startswith("._"):
-        return True
+        return appledouble == "1"
     return False
 
 
@@ -132,8 +146,8 @@ def build_model(archive):
     explicit_dirs = {}  # "a/b/" -> mtime
     all_dirs = set()
 
-    for name, isdir, size, mtime, enc in listed:
-        if not name or is_junk(name):
+    for name, isdir, size, mtime, enc, ad in listed:
+        if not name or is_junk(name, ad):
             continue
         if isdir == "1":
             d = name if name.endswith("/") else name + "/"
@@ -261,8 +275,8 @@ def cmd_probe(args):
     listed = _archive_list(args.archive)
     if listed is None:
         return 4
-    for name, isdir, size, mtime, enc in listed:
-        if isdir != "1" and enc == "1" and not is_junk(name):
+    for name, isdir, size, mtime, enc, ad in listed:
+        if isdir != "1" and enc == "1" and not is_junk(name, ad):
             print("encrypted")
             return 0
     print("plain")
@@ -319,14 +333,15 @@ def parent_prefix_of(folder):
 def _unique_in(dest, name, is_dir):
     """Finder-style unique name within dest: 'name', then 'name 2', 'name 3', ...
     For files the counter is inserted before the extension ('a.txt' -> 'a 2.txt');
-    for folders it is appended ('a' -> 'a 2')."""
-    if not name or not os.path.exists(os.path.join(dest, name)):
+    for folders it is appended ('a' -> 'a 2'). lexists, not exists: a dangling
+    symlink still occupies the name (renaming onto it would fail)."""
+    if not name or not os.path.lexists(os.path.join(dest, name)):
         return name
     stem, ext = (name, "") if is_dir else os.path.splitext(name)
     n = 2
     while True:
         cand = "%s %d%s" % (stem, n, ext)
-        if not os.path.exists(os.path.join(dest, cand)):
+        if not os.path.lexists(os.path.join(dest, cand)):
             return cand
         n += 1
 
@@ -339,6 +354,25 @@ def cmd_extract(args):
     archive_base = os.path.basename(args.archive)
     if archive_base.lower().endswith(".zip"):
         archive_base = archive_base[:-4]
+
+    listed = _archive_list(args.archive)
+    if listed is None:
+        return 4
+
+    # Callers pass --prefix for folders, but harden --entry too: an entry that
+    # is a directory (explicit trailing slash or a dir row in the model) is
+    # rerouted to prefix mode, where the whole subtree is extracted.
+    if args.entry is not None:
+        ename = args.entry
+        is_dir_entry = ename.endswith("/")
+        if not is_dir_entry:
+            for name, isdir, _sz, _mt, _enc, _ad in listed:
+                if isdir == "1" and name.rstrip("/") == ename:
+                    is_dir_entry = True
+                    break
+        if is_dir_entry:
+            args.prefix = ename if ename.endswith("/") else ename + "/"
+            args.entry = None
 
     # Decide which real entries to extract and how to map their output paths.
     def out_rel(name):
@@ -373,63 +407,96 @@ def cmd_extract(args):
         head, _, tail = rel.partition("/")
         return unique_top + ("/" + tail if tail else "")
 
-    listed = _archive_list(args.archive)
-    if listed is None:
-        return 4
+    # Count the files the helper will extract so progress can report a known
+    # total ("file N of M"). The filters mirror the helper's: junk skipped,
+    # directories excluded from the count, member/prefix matching. (For an
+    # ENCRYPTED non-AppleDouble "._*" file the helper - which has the password
+    # and can peek the magic - may extract one more file than counted here;
+    # the progress display is momentarily conservative, nothing else.)
+    total = 0
+    for name, isdir, size, mtime, enc, ad in listed:
+        if not name or is_junk(name, ad) or isdir == "1":
+            continue
+        if out_rel(name) is None:
+            continue
+        total += 1
 
-    # Resolve the set of files to extract up front so progress can report a known
-    # total ("file N of M"). Directories, junk, and non-matching entries are
-    # filtered here; unsafe (zip-slip) paths are counted as errors and skipped.
-    # out_rel/sanitize_rel keep every output path within dest.
-    todo = []
-    errors = 0
-    for name, isdir, size, mtime, enc in listed:
-        if not name or is_junk(name) or isdir == "1":
-            continue
-        rel = out_rel(name)
-        if rel is None:
-            continue
-        safe = sanitize_rel(retop(rel))
-        if safe is None:
-            eprint("skip unsafe path: %s" % name)
-            errors += 1
-            continue
-        todo.append((name, os.path.join(dest, safe)))
+    # The helper extracts with libarchive's archive_write_disk, which restores
+    # symlinks and permissions (executable bits!) that the old per-entry byte
+    # streaming lost - both are load-bearing for .app bundles. Its secure flags
+    # reject absolute/".." paths (zip-slip). Extraction lands in a private temp
+    # dir inside dest (same volume, so the final placement is a rename), then the
+    # single top-level item is moved to its Finder-style unique name.
+    tmproot = tempfile.mkdtemp(prefix=".ziptool-extract-", dir=dest)
+    cmd = [ARCHIVE_BIN, "extract", args.archive, tmproot, "--progress"]
+    if args.all:
+        cmd.append("--skip-junk")
+    elif args.prefix is not None:
+        cmd += ["--skip-junk", "--prefix", args.prefix]
+    else:
+        cmd.append(args.entry)
 
-    # Each matching file is streamed out of the helper to its mapped target. The
-    # helper decrypts plain/ZipCrypto/AES alike; the password (if any) goes on its
-    # stdin.
-    total = len(todo)
     count = 0
-    for name, target in todo:
+    try:
+        # stderr goes to a file, not a pipe: the helper can emit a diagnostic
+        # line per rejected entry with no matching stdout, and a filled stderr
+        # pipe would deadlock against our stdout read loop.
+        errf = tempfile.TemporaryFile()
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=errf)
         try:
-            os.makedirs(os.path.dirname(target) or dest, exist_ok=True)
-            with open(target, "wb") as dst:
-                r = subprocess.run([ARCHIVE_BIN, "read", args.archive, name],
-                                   input=(pwd or b""), stdout=dst, stderr=subprocess.PIPE)
-        except OSError as e:
-            eprint("skip %s: %s" % (name, e))
-            errors += 1
-            continue
-        if r.returncode != 0:
-            if r.stderr:
-                sys.stderr.buffer.write(r.stderr)
-            if r.returncode == 2:
-                return 2
-            eprint("extract error on %s" % name)
+            proc.stdin.write(pwd or b"")
+            proc.stdin.close()
+        except BrokenPipeError:
+            pass   # helper exited early (e.g. bad archive); rc handling below reports it
+        # One line per extracted file/symlink; batch into "file N of M" every
+        # PROGRESS_EVERY files (and always on the last) so OMC's PROGRESS counter
+        # advances the bar in batches rather than redrawing per item. The line is
+        # matched (and hidden) by the command's DETERMINATE_COUNTER.
+        for _line in proc.stdout:
+            count += 1
+            if count % PROGRESS_EVERY == 0 or count == total:
+                print("file %d of %d" % (count, total))
+                sys.stdout.flush()
+        rc = proc.wait()
+        if rc != 0:
+            errf.seek(0)
+            stderr = errf.read()
+            if stderr:
+                sys.stderr.buffer.write(stderr)
+            errf.close()
+            return 2 if rc == 2 else (4 if rc == 4 else 1)
+        errf.close()
+
+        # Move the extracted content to its final, uniquely named location.
+        if args.all:
+            src_top = tmproot
+        elif args.prefix is not None:
+            src_top = os.path.join(tmproot, *args.prefix.rstrip("/").split("/"))
+        else:
+            safe = sanitize_rel(args.entry)
+            src_top = os.path.join(tmproot, safe) if safe else None
+        if count > 0 and src_top and os.path.lexists(src_top) and unique_top:
+            final = os.path.join(dest, unique_top)
+            try:
+                os.rename(src_top, final)
+            except OSError as e:
+                eprint("cannot place extracted content: %s" % e)
+                return 1
+            if args.all:
+                # mkdtemp creates the dir 0700; opened folders should be normal.
+                os.chmod(final, 0o755)
+                tmproot = None   # renamed away; nothing left to clean up
+        elif count > 0:
+            eprint("extracted content not found at expected location")
             return 1
-        count += 1
-        # Determinate progress: emit a "file N of M" line every PROGRESS_EVERY
-        # files (and always on the last) so OMC's PROGRESS counter advances the
-        # bar in batches rather than redrawing per item. The line is matched (and
-        # hidden) by the command's DETERMINATE_COUNTER; the flush makes it live.
-        if count % PROGRESS_EVERY == 0 or count == total:
-            print("file %d of %d" % (count, total))
-            sys.stdout.flush()
+    finally:
+        if tmproot and os.path.isdir(tmproot):
+            shutil.rmtree(tmproot, ignore_errors=True)
 
     root = os.path.join(dest, unique_top) if unique_top else dest
     eprint("extracted %d item(s) to %s" % (count, root))
-    if count == 0 and errors == 0:
+    if count == 0:
         eprint("nothing matched")
         return 1
     # Machine-readable summary: "<count>\t<top-level path created>". With
@@ -464,21 +531,32 @@ def cmd_create(args):
 
 def _additions_from_sources(sources, prefix):
     """Yield (source_file, arcname) pairs. A folder keeps its own name as the
-    root under prefix; a file is stored as prefix + basename."""
+    root under prefix; a file is stored as prefix + basename.
+
+    Symlinks are collected as entries in their own right, never followed:
+    os.walk (followlinks=False) lists a symlink-to-dir in dirs without
+    recursing, and symlinks-to-files appear in files. Bundles (.app,
+    frameworks) depend on those links; following or dropping them breaks
+    code signatures ("unsealed contents" from duplicated framework binaries)."""
     pairs = []
     for src in sources:
         src = src.rstrip("/")
-        if not src or not os.path.exists(src):
+        if not src or not os.path.lexists(src):
             eprint("skip missing: %s" % src)
             continue
         base = os.path.basename(src)
-        if os.path.isdir(src):
+        if os.path.isdir(src) and not os.path.islink(src):
             parent = os.path.dirname(src)
-            for root, _dirs, files in os.walk(src):
+            for root, dirs, files in os.walk(src):
                 for fn in files:
                     full = os.path.join(root, fn)
                     rel = os.path.relpath(full, parent)   # keeps 'base/...'
                     pairs.append((full, prefix + rel.replace(os.sep, "/")))
+                for d in dirs:
+                    full = os.path.join(root, d)
+                    if os.path.islink(full):
+                        rel = os.path.relpath(full, parent)
+                        pairs.append((full, prefix + rel.replace(os.sep, "/")))
         else:
             pairs.append((src, prefix + base))
     return pairs
@@ -496,18 +574,23 @@ def cmd_add(args):
 
     # Stage the additions under their archive names, then let Info-ZIP add them in
     # place. zip appends/updates without recompressing existing entries (libarchive
-    # cannot modify in place); hardlinks avoid copying the source data.
+    # cannot modify in place); hardlinks avoid copying the source data. Symlinks
+    # are recreated as symlinks (os.link would follow to the target) and stored as
+    # such by zip -y.
     staging = tempfile.mkdtemp(prefix="zipadd-")
     try:
         for full, arc in to_add:
             dst = os.path.join(staging, arc)
             os.makedirs(os.path.dirname(dst) or staging, exist_ok=True)
+            if os.path.islink(full):
+                os.symlink(os.readlink(full), dst)
+                continue
             try:
                 os.link(full, dst)
             except OSError:
                 shutil.copy2(full, dst)
         archive_abs = os.path.abspath(args.archive)
-        r = subprocess.run(["/usr/bin/zip", "-r", "-q", "-X", archive_abs, "."],
+        r = subprocess.run(["/usr/bin/zip", "-r", "-q", "-X", "-y", archive_abs, "."],
                            cwd=staging, capture_output=True, text=True)
         if r.returncode != 0:
             eprint(r.stderr.strip() or r.stdout.strip())

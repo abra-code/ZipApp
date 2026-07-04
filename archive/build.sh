@@ -4,6 +4,8 @@
 #   ./build.sh            build a universal (arm64 + x86_64) ad-hoc-signed binary
 #                         into ./build/archive
 #   ./build.sh install    also copy it into ../Zip.app/Contents/Helpers/archive
+#                         and re-seal the app with appletbuilder (validate +
+#                         codesign), when the AppletBuilder CLI can be found
 #
 # archive links the system libarchive via the SDK's libarchive.tbd stub. No public
 # archive.h ships in the SDK, so archive.c declares the small ABI subset it uses.
@@ -39,5 +41,19 @@ if [ "$1" = "install" ]; then
     cp "$OUT" "$DEST/archive"
     codesign --force --timestamp=none --sign - "$DEST/archive"
     echo "Installed: $DEST/archive"
-    echo "Remember to re-seal the app:  appletbuilder build \"$APP\""
+
+    # Re-seal the app: a changed nested binary invalidates the bundle signature.
+    # The AppletBuilder CLI validates the whole applet and re-signs it. Look in
+    # the usual sibling checkout, then PATH; without it, just print the reminder.
+    AB="$HERE/../../OMC/Distribution/AppletBuilder.app/Contents/Resources/Agents/appletbuilder"
+    if [ ! -x "$AB" ]; then
+        AB="$(command -v appletbuilder || true)"
+    fi
+    if [ -n "$AB" ] && [ -x "$AB" ]; then
+        echo "Re-sealing the app with appletbuilder..."
+        "$AB" build "$APP"
+    else
+        echo "AppletBuilder CLI not found - re-seal the app manually:"
+        echo "  appletbuilder build \"$APP\""
+    fi
 fi
