@@ -1,0 +1,306 @@
+{
+  "type": "NavigationStack",
+  "content": {
+    "type": "VStack",
+    "properties": {
+      "spacing": 0,
+      "searchable": { "prompt": "Search", "actionID": "Zip.filter.changed" },
+      "frame": {
+        "minWidth": 720,
+        "minHeight": 460,
+        "idealWidth": 1000,
+        "idealHeight": 640,
+        "maxWidth": "infinity",
+        "maxHeight": "infinity"
+      }
+    },
+    "toolbar": [
+      {
+        "type": "ToolbarItemGroup",
+        "id": 90,
+        "properties": { "placement": "navigation" },
+        "children": [
+          {
+            "type": "Button",
+            "id": 33,
+            "properties": {
+              "title": "Extract",
+              "systemImage": "square.and.arrow.down",
+              "actionID": "Zip.extract.selected",
+              "disabled": true,
+              "help": "Extract the selected item"
+            }
+          },
+          {
+            "type": "Button",
+            "id": 34,
+            "properties": {
+              "title": "Extract All",
+              "systemImage": "square.and.arrow.down.on.square",
+              "actionID": "Zip.extract.all",
+              "disabled": true,
+              "help": "Extract the entire archive"
+            }
+          },
+          {
+            "type": "Button",
+            "id": 31,
+            "properties": {
+              "title": "Add",
+              "systemImage": "plus",
+              "actionID": "Zip.add.files",
+              "disabled": true,
+              "help": "Add files or folders to the archive"
+            }
+          },
+          {
+            "type": "Button",
+            "id": 32,
+            "properties": {
+              "title": "Delete",
+              "systemImage": "minus",
+              "actionID": "Zip.delete.selected",
+              "disabled": true,
+              "help": "Delete the selected item from the archive"
+            }
+          },
+          {
+            "type": "Button",
+            "id": 35,
+            "properties": {
+              "title": "View",
+              "systemImage": "eye",
+              "actionID": "Zip.quicklook",
+              "disabled": true,
+              "help": "Quick Look the selected file"
+            }
+          },
+          {
+            "type": "Menu",
+            "id": 36,
+            "properties": {
+              "title": "Password",
+              "help": "Encrypt, unlock, or change the archive password"
+            },
+            "label": {
+              "type": "Label",
+              "properties": { "title": "Password", "systemImage": "lock" }
+            },
+            "children": [
+              {
+                "type": "Button",
+                "id": 37,
+                "properties": {
+                  "title": "Unlock...",
+                  "systemImage": "lock.open",
+                  "actionID": "Zip.unlock",
+                  "disabled": true,
+                  "help": "Enter the password to read and extract this archive"
+                }
+              },
+              {
+                "type": "Button",
+                "id": 38,
+                "properties": {
+                  "title": "Encrypt with Password...",
+                  "systemImage": "lock",
+                  "actionID": "Zip.encrypt",
+                  "disabled": true,
+                  "help": "Encrypt the archive with AES-256"
+                }
+              },
+              {
+                "type": "Button",
+                "id": 39,
+                "properties": {
+                  "title": "Change Password...",
+                  "systemImage": "key",
+                  "actionID": "Zip.encrypt",
+                  "disabled": true,
+                  "help": "Change the archive password"
+                }
+              },
+              {
+                "type": "Button",
+                "id": 41,
+                "properties": {
+                  "title": "Remove Encryption...",
+                  "systemImage": "lock.slash",
+                  "actionID": "Zip.decrypt.all",
+                  "disabled": true,
+                  "help": "Decrypt and save the archive without a password"
+                }
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "children": [
+      {
+        "type": "HSplitView",
+        "properties": { "frame": { "maxWidth": "infinity", "maxHeight": "infinity" } },
+        "children": [
+          {
+            "type": "VStack",
+            "properties": {
+              "spacing": 0,
+              "frame": { "minWidth": 340, "idealWidth": 420, "maxHeight": "infinity" }
+            },
+            "children": [
+              {
+                "type": "HStack",
+                "properties": {
+                  "spacing": 6,
+                  "padding": { "top": 6, "leading": 10, "bottom": 6, "trailing": 10 }
+                },
+                "children": [
+                  {
+                    "type": "Button",
+                    "id": 50,
+                    "properties": {
+                      "systemImage": "chevron.up",
+                      "buttonStyle": "borderless",
+                      "actionID": "Zip.nav.up",
+                      "disabled": true
+                    }
+                  },
+                  {
+                    "type": "Text",
+                    "id": 51,
+                    "properties": {
+                      "text": "No archive open",
+                      "font": { "size": 11, "design": "monospaced" },
+                      "foregroundStyle": "secondary",
+                      "frame": { "maxWidth": "infinity", "alignment": "leading" }
+                    }
+                  }
+                ]
+              },
+              { "type": "Divider" },
+              {
+                "type": "Table",
+                "id": 10,
+                "properties": {
+                  "columns": ["", "Name", "Size"],
+                  "columnTypes": [
+                    { "viewType": "Image", "dataInterpretation": "systemName" },
+                    { "viewType": "Text" },
+                    { "viewType": "Text" }
+                  ],
+                  "widths": [24, 300, 90],
+                  "minWidths": [20, 160, 60],
+                  "actionID": "Zip.selection.changed",
+                  "doubleClickActionID": "Zip.row.activated",
+                  "onDropTypes": ["public.file-url", "public.folder"],
+                  "onDropActionID": "Zip.files.drop",
+                  "frame": { "maxWidth": "infinity", "maxHeight": "infinity" }
+                }
+              }
+            ]
+          },
+          {
+            "type": "VStack",
+            "properties": {
+              "spacing": 10,
+              "alignment": "leading",
+              "padding": "default",
+              "frame": { "minWidth": 300, "maxWidth": "infinity", "maxHeight": "infinity" }
+            },
+            "children": [
+              {
+                "type": "GroupBox",
+                "properties": { "title": "Details" },
+                "children": [
+                  {
+                    "type": "VStack",
+                    "properties": { "alignment": "leading", "spacing": 6 },
+                    "children": [
+                      {
+                        "type": "HStack",
+                        "properties": { "spacing": 8 },
+                        "children": [
+                          { "type": "Text", "properties": { "text": "Name", "foregroundStyle": "secondary", "frame": { "width": 80, "alignment": "trailing" } } },
+                          { "type": "Text", "id": 60, "properties": { "text": "-", "frame": { "maxWidth": "infinity", "alignment": "leading" } } }
+                        ]
+                      },
+                      {
+                        "type": "HStack",
+                        "properties": { "spacing": 8 },
+                        "children": [
+                          { "type": "Text", "properties": { "text": "Kind", "foregroundStyle": "secondary", "frame": { "width": 80, "alignment": "trailing" } } },
+                          { "type": "Text", "id": 65, "properties": { "text": "-", "multilineTextAlignment": "leading", "frame": { "maxWidth": "infinity", "alignment": "leading" } } }
+                        ]
+                      },
+                      {
+                        "type": "HStack",
+                        "properties": { "spacing": 8 },
+                        "children": [
+                          { "type": "Text", "properties": { "text": "Path", "foregroundStyle": "secondary", "frame": { "width": 80, "alignment": "trailing" } } },
+                          { "type": "Text", "id": 61, "properties": { "text": "-", "font": { "size": 11, "design": "monospaced" }, "frame": { "maxWidth": "infinity", "alignment": "leading" } } }
+                        ]
+                      },
+                      {
+                        "type": "HStack",
+                        "properties": { "spacing": 8 },
+                        "children": [
+                          { "type": "Text", "properties": { "text": "Size", "foregroundStyle": "secondary", "frame": { "width": 80, "alignment": "trailing" } } },
+                          { "type": "Text", "id": 62, "properties": { "text": "-", "frame": { "maxWidth": "infinity", "alignment": "leading" } } }
+                        ]
+                      },
+                      {
+                        "type": "HStack",
+                        "properties": { "spacing": 8 },
+                        "children": [
+                          { "type": "Text", "properties": { "text": "Modified", "foregroundStyle": "secondary", "frame": { "width": 80, "alignment": "trailing" } } },
+                          { "type": "Text", "id": 63, "properties": { "text": "-", "frame": { "maxWidth": "infinity", "alignment": "leading" } } }
+                        ]
+                      },
+                      {
+                        "type": "HStack",
+                        "properties": { "spacing": 8 },
+                        "children": [
+                          { "type": "Text", "properties": { "text": "Encrypted", "foregroundStyle": "secondary", "frame": { "width": 80, "alignment": "trailing" } } },
+                          { "type": "Text", "id": 64, "properties": { "text": "-", "frame": { "maxWidth": "infinity", "alignment": "leading" } } }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "type": "GroupBox",
+                "properties": { "title": "Preview", "frame": { "maxWidth": "infinity", "maxHeight": "infinity" } },
+                "children": [
+                  {
+                    "type": "TextEditor",
+                    "id": 70,
+                    "properties": {
+                      "readOnly": true,
+                      "font": { "size": 11, "design": "monospaced" },
+                      "background": "background.secondary",
+                      "scrollContentBackground": "hidden",
+                      "frame": { "minHeight": 160, "maxWidth": "infinity", "maxHeight": "infinity" }
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      { "type": "Divider" },
+      {
+        "type": "Text",
+        "id": 80,
+        "properties": {
+          "text": "Open a zip archive to browse its contents.",
+          "font": "footnote",
+          "foregroundStyle": "secondary",
+          "padding": { "top": 5, "leading": 18, "bottom": 5, "trailing": 18 },
+          "frame": { "maxWidth": "infinity", "alignment": "leading" }
+        }
+      }
+    ]
+  }
+}

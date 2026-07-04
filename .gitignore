@@ -1,0 +1,8 @@
+Zip.app/Contents/Frameworks
+Zip.app/Contents/Library/Python
+Zip.app/Contents/MacOS
+Zip.app/Contents/_CodeSignature
+.DS_Store
+Private
+archive/build
+Zip.app/Contents/Helpers

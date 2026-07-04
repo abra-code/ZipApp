@@ -1,0 +1,218 @@
+{
+  "COMMAND_LIST": [
+    {
+      "NAME": "Zip",
+      "ACTIVATION_MODE": "act_file_or_folder",
+      "EXECUTION_MODE": "exe_script_file",
+      "OPEN_OBJECT_DIALOG": {
+        "MESSAGE": "Choose a zip archive to open",
+        "ALLOWED_CONTENT_TYPES": [
+          "public.zip-archive",
+          "com.pkware.zip-archive"
+        ],
+        "BUTTON_PROMPT": "Open"
+      },
+      "ACTIONUI_WINDOW": {
+        "JSON_NAME": "Zip",
+        "END_CANCEL_SUBCOMMAND_ID": "Zip.window.close",
+        "IS_BLOCKING": false
+      },
+      "REQUIRED_OMC_VERSION": "5.1",
+      "REQUIRED_MAC_OS_MIN_VERSION": "14.6"
+    },
+    {
+      "NAME": "Zip",
+      "COMMAND_ID": "Zip.new",
+      "ACTIVATION_MODE": "act_always",
+      "EXECUTION_MODE": "exe_script_file",
+      "ACTIONUI_WINDOW": {
+        "JSON_NAME": "Zip",
+        "END_CANCEL_SUBCOMMAND_ID": "Zip.window.close",
+        "IS_BLOCKING": false
+      }
+    },
+    {
+      "NAME": "Zip",
+      "COMMAND_ID": "Zip.window.close",
+      "EXECUTION_MODE": "exe_script_file",
+      "WAIT_FOR_TASK_COMPLETION": true
+    },
+    {
+      "NAME": "Zip",
+      "COMMAND_ID": "Zip.save",
+      "ACTIVATION_MODE": "act_always",
+      "EXECUTION_MODE": "exe_script_file"
+    },
+    {
+      "NAME": "Zip",
+      "COMMAND_ID": "Zip.save.as",
+      "EXECUTION_MODE": "exe_script_file",
+      "SAVE_AS_DIALOG": {
+        "MESSAGE": "Save archive as",
+        "DEFAULT_FILE_NAME": [
+          "Untitled.zip"
+        ],
+        "DIALOG_IDENTIFIER": "Zip.save.location",
+        "USE_PATH_CACHING": true,
+        "BUTTON_PROMPT": "Save"
+      },
+      "WAIT_FOR_TASK_COMPLETION": true
+    },
+    {
+      "NAME": "Zip",
+      "COMMAND_ID": "Zip.selection.changed",
+      "EXECUTION_MODE": "exe_script_file"
+    },
+    {
+      "NAME": "Zip",
+      "COMMAND_ID": "Zip.row.activated",
+      "EXECUTION_MODE": "exe_script_file"
+    },
+    {
+      "NAME": "Zip",
+      "COMMAND_ID": "Zip.nav.up",
+      "EXECUTION_MODE": "exe_script_file"
+    },
+    {
+      "NAME": "Zip",
+      "COMMAND_ID": "Zip.filter.changed",
+      "EXECUTION_MODE": "exe_script_file"
+    },
+    {
+      "NAME": "Zip",
+      "COMMAND_ID": "Zip.add.files",
+      "EXECUTION_MODE": "exe_script_file",
+      "CHOOSE_OBJECT_DIALOG": {
+        "MESSAGE": "Choose files or folders to add to the archive",
+        "ALLOW_MULTIPLE_ITEMS": true,
+        "USE_PATH_CACHING": true,
+        "BUTTON_PROMPT": "Add"
+      },
+      "MULTIPLE_OBJECT_SETTINGS": {
+        "PROCESSING_MODE": "proc_together",
+        "SEPARATOR": "\n",
+        "SORT_METHOD": "sort_by_name"
+      }
+    },
+    {
+      "NAME": "Zip",
+      "COMMAND_ID": "Zip.files.drop",
+      "EXECUTION_MODE": "exe_script_file"
+    },
+    {
+      "NAME": "Zip",
+      "COMMAND_ID": "Zip.delete.selected",
+      "EXECUTION_MODE": "exe_script_file"
+    },
+    {
+      "NAME": "Zip",
+      "COMMAND_ID": "Zip.extract.selected",
+      "EXECUTION_MODE": "exe_script_file",
+      "CHOOSE_FOLDER_DIALOG": {
+        "MESSAGE": "Choose where to extract the selected item",
+        "DIALOG_IDENTIFIER": "Zip.extract.location",
+        "USE_PATH_CACHING": true,
+        "BUTTON_PROMPT": "Extract"
+      },
+      "PROGRESS": {
+        "TITLE": "Extracting",
+        "DELAY": 2,
+        "DETERMINATE_COUNTER": {
+          "REGULAR_EXPRESSION_MATCH": "file ([0-9]+) of ([0-9]+)",
+          "STATUS": "Extracting item $1 of $2",
+          "SUBSTRING_INDEX_FOR_COUNTER": 1,
+          "SUBSTRING_INDEX_FOR_RANGE_END": 2,
+          "SUPPRESS_NON_MATCHING_TEXT": true
+        }
+      }
+    },
+    {
+      "NAME": "Zip",
+      "COMMAND_ID": "Zip.extract.all",
+      "EXECUTION_MODE": "exe_script_file",
+      "CHOOSE_FOLDER_DIALOG": {
+        "MESSAGE": "Choose where to extract the whole archive",
+        "DIALOG_IDENTIFIER": "Zip.extract.location",
+        "USE_PATH_CACHING": true,
+        "BUTTON_PROMPT": "Extract"
+      },
+      "PROGRESS": {
+        "TITLE": "Extracting",
+        "DELAY": 2,
+        "DETERMINATE_COUNTER": {
+          "REGULAR_EXPRESSION_MATCH": "file ([0-9]+) of ([0-9]+)",
+          "STATUS": "Extracting item $1 of $2",
+          "SUBSTRING_INDEX_FOR_COUNTER": 1,
+          "SUBSTRING_INDEX_FOR_RANGE_END": 2,
+          "SUPPRESS_NON_MATCHING_TEXT": true
+        }
+      }
+    },
+    {
+      "NAME": "Zip",
+      "COMMAND_ID": "Zip.password.prompt",
+      "EXECUTION_MODE": "exe_script_file",
+      "INPUT_DIALOG": {
+        "INPUT_TYPE": "input_password_text",
+        "MESSAGE": "This archive is encrypted. Enter the password:"
+      }
+    },
+    {
+      "NAME": "Zip",
+      "COMMAND_ID": "Zip.extract.run",
+      "EXECUTION_MODE": "exe_script_file",
+      "PROGRESS": {
+        "TITLE": "Extracting",
+        "DELAY": 2,
+        "DETERMINATE_COUNTER": {
+          "REGULAR_EXPRESSION_MATCH": "file ([0-9]+) of ([0-9]+)",
+          "STATUS": "Extracting item $1 of $2",
+          "SUBSTRING_INDEX_FOR_COUNTER": 1,
+          "SUBSTRING_INDEX_FOR_RANGE_END": 2,
+          "SUPPRESS_NON_MATCHING_TEXT": true
+        }
+      }
+    },
+    {
+      "NAME": "Zip",
+      "COMMAND_ID": "Zip.quicklook",
+      "EXECUTION_MODE": "exe_script_file"
+    },
+    {
+      "NAME": "Zip",
+      "COMMAND_ID": "Zip.unlock",
+      "EXECUTION_MODE": "exe_script_file"
+    },
+    {
+      "NAME": "Zip",
+      "COMMAND_ID": "Zip.unlock.confirm",
+      "EXECUTION_MODE": "exe_script_file"
+    },
+    {
+      "NAME": "Zip",
+      "COMMAND_ID": "Zip.encrypt",
+      "EXECUTION_MODE": "exe_script_file"
+    },
+    {
+      "NAME": "Zip",
+      "COMMAND_ID": "Zip.encrypt.confirm",
+      "EXECUTION_MODE": "exe_script_file"
+    },
+    {
+      "NAME": "Zip",
+      "COMMAND_ID": "Zip.sheet.cancel",
+      "EXECUTION_MODE": "exe_script_file"
+    },
+    {
+      "NAME": "Zip",
+      "COMMAND_ID": "Zip.decrypt.all",
+      "EXECUTION_MODE": "exe_script_file"
+    },
+    {
+      "NAME": "Zip",
+      "COMMAND_ID": "Zip.reveal",
+      "EXECUTION_MODE": "exe_script_file"
+    }
+  ],
+  "VERSION": 2
+}

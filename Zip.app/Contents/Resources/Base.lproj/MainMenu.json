@@ -1,0 +1,38 @@
+[
+  {
+    "type": "CommandGroup",
+    "properties": { "placement": "replacing", "placementTarget": "new" },
+    "children": [
+      {
+        "type": "Button",
+        "properties": {
+          "title": "New",
+          "actionID": "Zip.new",
+          "keyboardShortcut": { "key": "n", "modifiers": ["command"] }
+        }
+      }
+    ]
+  },
+  {
+    "type": "CommandGroup",
+    "properties": { "placement": "after", "placementTarget": "saveItem" },
+    "children": [
+      {
+        "type": "Button",
+        "properties": {
+          "title": "Save",
+          "actionID": "Zip.save",
+          "keyboardShortcut": { "key": "s", "modifiers": ["command"] }
+        }
+      },
+      {
+        "type": "Button",
+        "properties": {
+          "title": "Save As…",
+          "actionID": "Zip.save.as",
+          "keyboardShortcut": { "key": "s", "modifiers": ["command", "shift"] }
+        }
+      }
+    ]
+  }
+]
