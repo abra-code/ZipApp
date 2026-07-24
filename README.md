@@ -10,8 +10,6 @@ A native macOS zip archive manager. Open a `.zip`, browse its contents in a Find
 
 Open a zip from Finder (double-click / Open With), by dropping it on the window, or through the in-app Open panel. Zip lists the archive's entries with name, size, compressed size, modified date, and an encrypted indicator, and lets you drill into folders with a breadcrumb or search across a flat filtered view.
 
-Zip is built on the [OMC](https://abracode.com) framework with an ActionUI declarative UI engine. The UI is defined in `Contents/Resources/Base.lproj/`; all logic runs as Python 3 scripts in `Contents/Resources/Scripts/`, driving the system archive tools with a small bundled helper for encrypted reads.
-
 ---
 
 ## Requirements
