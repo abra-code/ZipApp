@@ -55,7 +55,6 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 
-#include <fstream>
 #include <memory>
 #include <new>
 #include <optional>
@@ -97,6 +96,38 @@ using ArchiveReadPtr  = std::unique_ptr<struct archive, ArchiveReadDeleter>;
 using ArchiveWritePtr = std::unique_ptr<struct archive, ArchiveWriteDeleter>;
 using ArchiveEntryPtr = std::unique_ptr<struct archive_entry, ArchiveEntryDeleter>;
 using FilePtr         = std::unique_ptr<FILE, FileDeleter>;
+
+/* One manifest line at a time, unbounded, owning getline(3)'s buffer.
+ *
+ * POSIX getline(3) rather than std::getline on an ifstream, for one reason: a
+ * mid-file READ ERROR has to be distinguishable from a clean end of input, or
+ * the check after the loop cannot tell a truncated manifest from a complete
+ * one. libc++ reports both identically - measured: eofbit and failbit set,
+ * badbit CLEAR in each case - so no state on the stream answers the question.
+ * ferror() answers it exactly, and it is the mechanism the payload read in the
+ * same function already relies on. getline(3) also grows the buffer as needed,
+ * so no path is capped by a fixed line length the way fgets() capped it. */
+class LineReader {
+public:
+    LineReader() = default;
+    ~LineReader() { free(buf_); }
+    LineReader(const LineReader &) = delete;
+    LineReader &operator=(const LineReader &) = delete;
+
+    /* The line WITH its terminator, or nullopt at end of input - which may be a
+     * clean end or an error, so the caller must then ask ferror(). */
+    std::optional<std::string> next(FILE *f)
+    {
+        ssize_t n = getline(&buf_, &cap_, f);
+        if (n < 0)
+            return std::nullopt;
+        return std::string(buf_, (size_t)n);
+    }
+
+private:
+    char *buf_ = nullptr;
+    size_t cap_ = 0;
+};
 
 /* Raised when no free variant of a name is left (10000 tried). Handled exactly
  * like an allocation failure at the same point: this ENTRY gets no name. */
@@ -292,8 +323,14 @@ int cmd_read(const char *path, const char *entry, long long maxbytes, const std:
         }
         break;
     }
-    if (r < ARCHIVE_OK && r != ARCHIVE_EOF && rc == 1)
+    /* A header-level failure before the entry was found. The reason has to be
+     * printed here: this is the only exit that would otherwise say nothing at
+     * all, and "exit 1, empty stderr" gives the caller and the user nothing to
+     * act on. cmd_list has always printed it; these paths never did. */
+    if (r < ARCHIVE_OK && r != ARCHIVE_EOF && rc == 1) {
         rc = is_passphrase_error(a.get()) ? 2 : 1;
+        fprintf(stderr, "archive: read error: %s\n", errstr(a.get()));
+    }
     if (rc == 1 && r == ARCHIVE_EOF)
         fprintf(stderr, "archive: no such entry: %s\n", entry);
 
@@ -309,7 +346,20 @@ int cmd_read(const char *path, const char *entry, long long maxbytes, const std:
 
 /* ---- extract: all or listed members into destdir -------------------------- */
 
-int copy_data(struct archive *ar, struct archive *aw)
+/* Which handle failed, so the caller can ask the right one for the message.
+ * Collapsing both sides into one return code meant a write failure was
+ * diagnosed from the READER's error string: extracting onto a full volume
+ * printed "unknown error" (the reader never failed, so it had no message)
+ * while the real ENOSPC text sat unread on the writer. Worse, the exit code
+ * was chosen by running is_passphrase_error() over that stale reader string,
+ * so a disk-full run could exit 2 and send the caller off to re-prompt for a
+ * password that was never the problem. */
+struct CopyResult {
+    int rc;             /* ARCHIVE_OK, or the failing call's return */
+    bool write_side;    /* the failure came from the writer, not the reader */
+};
+
+CopyResult copy_data(struct archive *ar, struct archive *aw)
 {
     for (;;) {
         const void *buff;
@@ -317,11 +367,12 @@ int copy_data(struct archive *ar, struct archive *aw)
         la_int64_t offset;
         int r = archive_read_data_block(ar, &buff, &size, &offset);
         if (r == ARCHIVE_EOF)
-            return ARCHIVE_OK;
+            return { ARCHIVE_OK, false };
         if (r < ARCHIVE_OK)
-            return r;
-        if (archive_write_data_block(aw, buff, size, offset) < ARCHIVE_OK)
-            return ARCHIVE_FATAL;
+            return { r, false };
+        int w = archive_write_data_block(aw, buff, size, offset);
+        if (w < ARCHIVE_OK)
+            return { w, true };
     }
 }
 
@@ -885,9 +936,19 @@ int cmd_extract(const char *path, const char *destdir, const std::vector<const c
                 fprintf(stderr, "archive: write data: %s\n", errstr(ext.get()));
                 break;
             }
-            if (copy_data(a.get(), ext.get()) < ARCHIVE_OK) {
-                rc = is_passphrase_error(a.get()) ? 2 : 1;
-                fprintf(stderr, "archive: extract error: %s\n", errstr(a.get()));
+            CopyResult cp = copy_data(a.get(), ext.get());
+            if (cp.rc < ARCHIVE_OK) {
+                /* A write failure is never a passphrase problem, and its message
+                 * lives on the writer - see CopyResult. Out of disk space is the
+                 * common case and the user needs to be told that, not "unknown
+                 * error" and a password prompt. */
+                if (cp.write_side) {
+                    rc = 1;
+                    fprintf(stderr, "archive: write data: %s\n", errstr(ext.get()));
+                } else {
+                    rc = is_passphrase_error(a.get()) ? 2 : 1;
+                    fprintf(stderr, "archive: extract error: %s\n", errstr(a.get()));
+                }
                 break;
             }
         }
@@ -937,8 +998,14 @@ int cmd_extract(const char *path, const char *destdir, const std::vector<const c
         fprintf(stderr, "archive: %s\n", ex.what());
         rc = 1;
     }
-    if (r < ARCHIVE_OK && r != ARCHIVE_EOF && rc == 0)
+    /* Say why. Without this the whole run ends at exit 1 with nothing on stderr,
+     * so a corrupted central directory - which the seekable zip reader hits on
+     * the FIRST next_header, condemning even entries stored before the damage -
+     * looked indistinguishable from an unexplained failure. */
+    if (r < ARCHIVE_OK && r != ARCHIVE_EOF && rc == 0) {
         rc = is_passphrase_error(a.get()) ? 2 : 1;
+        fprintf(stderr, "archive: read error: %s\n", errstr(a.get()));
+    }
 
     /* Checked for symmetry only: archive_write_disk's close() just forwards the
      * last finish_entry, which is already ARCHIVE_OK here because the loop calls
@@ -1010,7 +1077,7 @@ int cmd_list(const char *path, bool nul)
         return 4;
     }
     struct archive_entry *e;
-    int r, warned = 0;
+    int r, warned = 0, unnamed = 0;
     char tbuf[32];
     /* ARCHIVE_WARN: header read, entry usable - see cmd_extract. Stopping here
      * made a single odd header report the whole archive as invalid, which in the
@@ -1019,8 +1086,18 @@ int cmd_list(const char *path, bool nul)
         if (r == ARCHIVE_WARN)
             warned++;
         const char *name = archive_entry_pathname(e);
-        if (name == nullptr)
+        /* An entry whose name libarchive discarded is DELIBERATELY not listed:
+         * every field of a record is addressed by that name, and there is none.
+         * Extraction does the opposite - it invents "unnamed N" and writes the
+         * file, because it only has to create something, not name something the
+         * caller can then ask for. So a listing can legitimately hold fewer
+         * entries than an extraction produces, and any total computed from the
+         * listing will disagree. That is a choice, not an oversight, and it is
+         * counted and reported below so the disagreement is never silent. */
+        if (name == nullptr) {
+            unnamed++;
             continue;
+        }
         int isdir = S_ISDIR(archive_entry_filetype(e)) ? 1 : 0;
         long long size = (long long) archive_entry_size(e);
         time_t mt = archive_entry_mtime(e);
@@ -1067,6 +1144,11 @@ int cmd_list(const char *path, bool nul)
     if (warned > 0)
         fprintf(stderr, "archive: %d entr%s had a header warning\n",
                 warned, warned == 1 ? "y" : "ies");
+    if (unnamed > 0)
+        fprintf(stderr, "archive: %d entr%s not listed - the name could not be "
+                        "decoded (extraction still recovers %s)\n",
+                unnamed, unnamed == 1 ? "y" : "ies",
+                unnamed == 1 ? "it" : "them");
     /* A short write would hand the caller a TRUNCATED listing with a success
      * code, and cmd_delete diffs before/after listings as sets - a truncated
      * "after" reads as entries removed that were never targeted. Same class as
@@ -1183,10 +1265,16 @@ int cmd_recrypt(const char *src, const char *dst, const char *mode,
         fprintf(stderr, "archive: %s\n", ex.what());
         rc = 1;
     }
-    if (r < ARCHIVE_OK && r != ARCHIVE_EOF && rc == 0)
+    /* Say why - see cmd_extract. This one matters most: recrypt also unlinks its
+     * destination, so without a reason the user is told nothing and left with
+     * nothing. */
+    if (r < ARCHIVE_OK && r != ARCHIVE_EOF && rc == 0) {
         rc = is_passphrase_error(a.get()) ? 2 : 1;
+        fprintf(stderr, "archive: read error: %s\n", errstr(a.get()));
+    }
 
-    if (archive_write_close(w.get()) != ARCHIVE_OK && rc == 0) rc = 1;
+    if (archive_write_close(w.get()) != ARCHIVE_OK && rc == 0)
+        rc = 1;
     w.reset();                         /* flush and release before unlinking */
     if (rc != 0) unlink(dst);          /* same reason as cmd_create */
     if (rc == 0)
@@ -1200,19 +1288,16 @@ int cmd_recrypt(const char *src, const char *dst, const char *mode,
  * Optional encryption via <mode>+passphrase. */
 int cmd_create(const char *dst, const char *manifest, const char *mode, const std::string &pass)
 {
-    /* std::getline rather than fgets: a manifest line is one source path, and a
-     * fixed line buffer silently split any path longer than it into two bogus
-     * lines. The payload below stays on stdio - it needs ferror() to tell a read
-     * error from a clean EOF. */
-    std::ifstream mf;
+    FilePtr mf;
     if (manifest != nullptr) {
-        mf.open(manifest, std::ios::binary);
-        if (!mf.is_open()) {
+        mf.reset(fopen(manifest, "rb"));
+        if (!mf) {
             fprintf(stderr, "archive: cannot read manifest: %s\n", manifest);
             return 1;
         }
     }
     /* Before the writer opens <dst> - see the note in cmd_recrypt. */
+    LineReader lines;
     std::vector<char> buf(BLOCK);
 
     ArchiveWritePtr w = open_zip_writer(dst, mode, pass);
@@ -1221,8 +1306,11 @@ int cmd_create(const char *dst, const char *manifest, const char *mode, const st
 
     int rc = 0, count = 0;
     try {
-    std::string line;
-    while (manifest != nullptr && std::getline(mf, line)) {
+    while (mf) {
+        std::optional<std::string> got = lines.next(mf.get());
+        if (!got)
+            break;                  /* end of input - clean or not; checked below */
+        std::string line = std::move(*got);
         /* A path cannot contain NUL, so a line that does is malformed. getline
          * keeps those bytes where fgets+strlen ended the line at the first one,
          * and without this the tab AFTER an embedded NUL would still be found -
@@ -1314,15 +1402,28 @@ int cmd_create(const char *dst, const char *manifest, const char *mode, const st
         }
         count++;
     }
+    /* The loop ends the same way for a clean end-of-manifest and for a read
+     * error, so without this an I/O error part-way through the manifest simply
+     * stopped enumerating and the command reported "created <dst> with N
+     * file(s)" and exited 0 - a TRUNCATED archive presented as complete, the
+     * one outcome this tool's partial-result accounting exists to prevent. It
+     * is the same defect the ferror() check above closed on the payload read;
+     * the manifest read never got the same treatment. */
+    if (rc == 0 && mf && ferror(mf.get())) {
+        fprintf(stderr, "archive: read error on manifest: %s\n", manifest);
+        rc = 1;
+    }
     } catch (const std::exception &ex) {
         fprintf(stderr, "archive: %s\n", ex.what());
         rc = 1;
     }
-    if (archive_write_close(w.get()) != ARCHIVE_OK && rc == 0) rc = 1;
+    if (archive_write_close(w.get()) != ARCHIVE_OK && rc == 0)
+        rc = 1;
     w.reset();                         /* flush and release before unlinking */
     /* Never leave a half-written archive behind for the caller to mistake for a
      * real one - the same cleanup do_recrypt does on the Python side. */
-    if (rc != 0) unlink(dst);
+    if (rc != 0)
+        unlink(dst);
     if (rc == 0)
         fprintf(stderr, "archive: created %s with %d file(s) (%s)\n", dst, count, mode);
     return rc;
