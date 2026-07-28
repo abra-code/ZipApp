@@ -22,6 +22,10 @@
  * Exit codes (aligned with Scripts/ziptool.py):
  *   0 ok | 1 generic error / entry not found | 2 passphrase required or incorrect
  *   4 cannot open / not a valid archive
+ *   5 extract only: PARTIAL - some entries were rejected (unsafe path, name
+ *     collision) but everything else did extract and is on disk. The caller
+ *     keeps the output and reports the skipped count; it must not present the
+ *     result as a complete extraction.
  *
  * The macOS SDK ships no public archive.h, so libarchive 3.7.4's public headers
  * (archive.h, archive_entry.h - BSD 2-clause) are vendored next to this source.
@@ -261,7 +265,7 @@ static int cmd_extract(const char *path, const char *destdir, int memberc, char 
     archive_write_disk_set_standard_lookup(ext);
 
     struct archive_entry *e;
-    int rc = 0, r, count = 0;
+    int rc = 0, r, count = 0, skipped = 0;
     while ((r = archive_read_next_header(a, &e)) == ARCHIVE_OK) {
         const char *pathname = archive_entry_pathname(e);
         if (!member_wanted(pathname, memberc, memberv))
@@ -287,10 +291,33 @@ static int cmd_extract(const char *path, const char *destdir, int memberc, char 
                 break;
             }
         }
-        if (archive_write_header(ext, e) != ARCHIVE_OK) {
-            fprintf(stderr, "archive: write header: %s\n", archive_error_string(ext));
+        /* Only ARCHIVE_OK and ARCHIVE_WARN mean the entry exists on disk now.
+         * WARN is a partial success (some attribute could not be restored) and
+         * MUST still receive its data - skipping it left a 0-byte file.
+         *
+         * Anything worse means nothing was created, but that is NOT necessarily
+         * an extraction failure: ARCHIVE_FAILED is the by-design outcome for
+         * every entry the ARCHIVE_EXTRACT_SECURE_* flags reject (absolute path,
+         * "..", traversal through a symlink) and for local defects such as a
+         * name colliding with an existing file. Failing the whole run over one
+         * of those would discard every good file with it - a far bigger loss
+         * than the rejected entry. So count it and keep going; the exit code
+         * (5) and the count tell the caller the result is partial, which is what
+         * actually matters: a partial extraction must never be presented as
+         * complete. Only ARCHIVE_FATAL, where the writer is unusable, aborts. */
+        int wh = archive_write_header(ext, e);
+        if (wh != ARCHIVE_OK && wh != ARCHIVE_WARN) {
+            fprintf(stderr, "archive: skipped %s: %s\n",
+                    pathname ? pathname : "(unnamed)", archive_error_string(ext));
+            skipped++;
+            if (wh == ARCHIVE_FATAL) {
+                rc = 1;
+                break;
+            }
             continue;
         }
+        if (wh == ARCHIVE_WARN)
+            fprintf(stderr, "archive: warning: %s\n", archive_error_string(ext));
         /* Regular files carry data; symlinks and directories are fully described
          * by the header (the zip reader resolves symlink targets on open). */
         if (S_ISREG(archive_entry_filetype(e))) {
@@ -305,7 +332,21 @@ static int cmd_extract(const char *path, const char *destdir, int memberc, char 
                 break;
             }
         }
-        archive_write_finish_entry(ext);
+        /* finish_entry is where deferred work lands (padding a sparse file,
+         * restoring times). A failure here means the entry is on disk but not
+         * intact, so it must not be counted as extracted - same partial-result
+         * accounting as a rejected header above. */
+        int fe = archive_write_finish_entry(ext);
+        if (fe != ARCHIVE_OK && fe != ARCHIVE_WARN) {
+            fprintf(stderr, "archive: incomplete %s: %s\n",
+                    pathname ? pathname : "(unnamed)", archive_error_string(ext));
+            skipped++;
+            if (fe == ARCHIVE_FATAL) {
+                rc = 1;
+                break;
+            }
+            continue;
+        }
         /* One stdout line per extracted file/symlink (dirs excluded) so the
          * caller can turn the stream into live progress. The line carries only
          * the running number - entry names could contain newlines and corrupt
@@ -319,13 +360,36 @@ static int cmd_extract(const char *path, const char *destdir, int memberc, char 
     if (r < ARCHIVE_OK && r != ARCHIVE_EOF && rc == 0)
         rc = is_passphrase_error(a) ? 2 : 1;
 
-    archive_write_close(ext);
+    /* Checked for symmetry only: archive_write_disk's close() just forwards the
+     * last finish_entry, which is already ARCHIVE_OK here because the loop calls
+     * finish_entry per entry. The deferred directory fixups it performs (times,
+     * permissions, ACLs, flags) have their return values discarded internally,
+     * so libarchive offers no way to detect a failure in them. */
+    int cl = archive_write_close(ext);
+    if (cl != ARCHIVE_OK && cl != ARCHIVE_WARN) {
+        fprintf(stderr, "archive: close: %s\n", archive_error_string(ext));
+        if (rc == 0)
+            rc = 1;
+    }
     archive_write_free(ext);
     archive_read_close(a);
     archive_read_free(a);
 
+    /* Promote to "partial" only after the read-side result is known, so a real
+     * passphrase error still surfaces as 2 rather than being masked by a skip. */
+    if (rc == 0 && skipped > 0)
+        rc = 5;
+
+    /* Machine-readable tail for the caller's progress stream: entry names could
+     * contain newlines, but this line is a fixed keyword plus an integer. */
+    if (progress) {
+        printf("skipped %d\n", skipped);
+        fflush(stdout);
+    }
     if (rc == 0)
         fprintf(stderr, "archive: extracted %d item(s)\n", count);
+    else if (rc == 5)
+        fprintf(stderr, "archive: extracted %d item(s), %d not extracted\n", count, skipped);
     return rc;
 }
 

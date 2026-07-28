@@ -25,6 +25,8 @@ Design notes:
   * Extraction sanitizes member names to stay within the destination (zip-slip).
 
 Exit codes: 0 ok | 1 generic error | 2 needs/incorrect password | 4 not a valid zip
+            5 extract only: partial - some entries were rejected (unsafe path,
+              name collision) but the rest extracted and are placed on disk
 """
 
 import argparse
@@ -437,6 +439,7 @@ def cmd_extract(args):
         cmd.append(args.entry)
 
     count = 0
+    skipped = 0
     try:
         # stderr goes to a file, not a pipe: the helper can emit a diagnostic
         # line per rejected entry with no matching stdout, and a filled stderr
@@ -453,19 +456,36 @@ def cmd_extract(args):
         # PROGRESS_EVERY files (and always on the last) so OMC's PROGRESS counter
         # advances the bar in batches rather than redrawing per item. The line is
         # matched (and hidden) by the command's DETERMINATE_COUNTER.
-        for _line in proc.stdout:
+        for line in proc.stdout:
+            # The helper's tail line ("skipped N") reports entries it refused to
+            # extract - unsafe paths, name collisions. It is not a progress tick.
+            if line.startswith(b"skipped "):
+                try:
+                    skipped = int(line.split()[1])
+                except (ValueError, IndexError):
+                    pass
+                continue
             count += 1
             if count % PROGRESS_EVERY == 0 or count == total:
                 print("file %d of %d" % (count, total))
                 sys.stdout.flush()
         rc = proc.wait()
-        if rc != 0:
+        # rc 5 is a PARTIAL extraction: some entries were rejected, but the rest
+        # are on disk and must be kept and placed. Discarding them would lose far
+        # more than the rejected entries. The skipped count travels in the
+        # summary so the caller never calls a partial result complete.
+        if rc not in (0, 5):
             errf.seek(0)
             stderr = errf.read()
             if stderr:
                 sys.stderr.buffer.write(stderr)
             errf.close()
             return 2 if rc == 2 else (4 if rc == 4 else 1)
+        if rc == 5:
+            errf.seek(0)
+            stderr = errf.read()
+            if stderr:
+                sys.stderr.buffer.write(stderr)
         errf.close()
 
         # Move the extracted content to its final, uniquely named location.
@@ -496,13 +516,16 @@ def cmd_extract(args):
 
     root = os.path.join(dest, unique_top) if unique_top else dest
     eprint("extracted %d item(s) to %s" % (count, root))
+    if skipped:
+        eprint("%d entr%s could not be extracted" % (skipped, "y" if skipped == 1 else "ies"))
     if count == 0:
         eprint("nothing matched")
         return 1
-    # Machine-readable summary: "<count>\t<top-level path created>". With
-    # --result-file it is written there so stdout stays reserved for the live
-    # progress lines OMC parses; otherwise it is printed to stdout (CLI use).
-    summary = "%d\t%s" % (count, root)
+    # Machine-readable summary: "<count>\t<top-level path created>\t<skipped>".
+    # With --result-file it is written there so stdout stays reserved for the
+    # live progress lines OMC parses; otherwise it is printed to stdout (CLI
+    # use). Readers must tolerate the older 2-field form.
+    summary = "%d\t%s\t%d" % (count, root, skipped)
     if getattr(args, "result_file", None):
         try:
             with open(args.result_file, "w", encoding="utf-8") as rf:
@@ -511,7 +534,7 @@ def cmd_extract(args):
             eprint("result-file write failed: %s" % e)
     else:
         print(summary)
-    return 0
+    return 5 if skipped else 0
 
 
 # --------------------------------------------------------------------------- create / add / delete
@@ -601,15 +624,36 @@ def cmd_add(args):
     return 0
 
 
+def zip_pattern(name):
+    r"""Escape Info-ZIP's glob metacharacters so `zip -d` matches <name> literally.
+
+    zip -d takes PATTERNS, not names. An entry whose stored name contains *, ?
+    or [ would otherwise take its siblings with it: `zip -d a.zip 'a?c.txt'`
+    deletes abc.txt and a*c.txt as well, and reports success.
+
+    Escaping rather than -nw is deliberate: -nw is INCOMPLETE, not inapplicable.
+    It does make *, [ and \ literal for -d, but ? still globs (verified both
+    orderings, with and without --), so -nw alone would silently reinstate the
+    single-character-wildcard case. Backslash-escaping covers all of them; \ is
+    escaped first, which the per-character map does for free."""
+    return "".join("\\" + ch if ch in "\\[]*?" else ch for ch in name)
+
+
 def cmd_delete(args):
     if args.entry is not None:
-        targets = [args.entry]
+        targets = [zip_pattern(args.entry)]
     elif args.prefix is not None:
-        targets = [args.prefix, args.prefix + "*"]   # folder marker + descendants
+        # Folder marker + descendants. The prefix itself is escaped so its own
+        # metacharacters stay literal; the trailing "*" is the one wildcard we
+        # actually want (Info-ZIP matches it across "/").
+        targets = [zip_pattern(args.prefix), zip_pattern(args.prefix) + "*"]
     else:
         eprint("need --entry or --prefix")
         return 1
-    r = subprocess.run(["/usr/bin/zip", "-d", args.archive] + targets,
+    # "--" ends zip's option parsing so an entry named "-r" or "-@" is treated as
+    # a name, not a flag. It does not disable wildcards, so the prefix form's
+    # deliberate trailing "*" still matches descendants.
+    r = subprocess.run(["/usr/bin/zip", "-d", args.archive, "--"] + targets,
                        capture_output=True, text=True)
     if r.returncode != 0 and "Nothing to do" not in (r.stdout + r.stderr):
         eprint(r.stderr.strip() or r.stdout.strip())

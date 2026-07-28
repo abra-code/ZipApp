@@ -308,7 +308,7 @@ def _probe(arc):
 # --- Population / navigation ---------------------------------------------
 def populate_level(prefix):
     pb_set(PB_PREFIX, prefix)
-    r = run_ziptool("level", "--tsv", tsv_path(), "--prefix", prefix)
+    r = run_ziptool("level", "--tsv=%s" % tsv_path(), "--prefix=%s" % prefix)
     feed_table((r.stdout or b"").decode("utf-8", "replace"))
     if prefix:
         set_breadcrumb("/" + prefix)
@@ -322,7 +322,7 @@ def populate_level(prefix):
 
 
 def populate_filter(query):
-    r = run_ziptool("find", "--tsv", tsv_path(), "--query", query)
+    r = run_ziptool("find", "--tsv=%s" % tsv_path(), "--query=%s" % query)
     feed_table((r.stdout or b"").decode("utf-8", "replace"))
     set_breadcrumb("Filter: " + query)
     enable_view(ID_UP_BTN, False)
@@ -380,7 +380,8 @@ def extract_for_preview(entry, pw):
     rf = tempfile.NamedTemporaryFile(prefix="zipql-", delete=False)
     rf_path = rf.name
     rf.close()
-    args = ["extract", arc, "--dest", pdir, "--entry", entry, "--result-file", rf_path]
+    args = ["extract", arc, "--dest=%s" % pdir, "--entry=%s" % entry,
+            "--result-file=%s" % rf_path]
     if pw:
         args.append("--pwd-stdin")
     r = run_ziptool(*args, stdin=(pw or None))
@@ -388,7 +389,7 @@ def extract_for_preview(entry, pw):
     try:
         with open(rf_path, "r", encoding="utf-8") as f:
             parts = f.read().strip().split("\t")
-        if len(parts) == 2 and parts[0].isdigit():
+        if len(parts) >= 2 and parts[0].isdigit():
             root = parts[1]
     except OSError:
         pass
@@ -397,7 +398,9 @@ def extract_for_preview(entry, pw):
             os.remove(rf_path)
         except OSError:
             pass
-    if r.returncode == 0 and root and os.path.exists(root):
+    # 5 is a partial extraction; for a single-entry preview it still means this
+    # entry landed, so the preview is valid.
+    if r.returncode in (0, 5) and root and os.path.exists(root):
         return root
     return None
 
@@ -524,7 +527,7 @@ def add_paths(paths, prefix=None):
         recrypted = scratch + ".recrypt"
         try:
             shutil.copy2(work, scratch)
-            r = run_ziptool("add", scratch, "--prefix", prefix, stdin="\n".join(paths))
+            r = run_ziptool("add", scratch, "--prefix=%s" % prefix, stdin="\n".join(paths))
             if r.returncode != 0:
                 alert("Could not add the selected items.", level="caution")
                 return
@@ -545,7 +548,7 @@ def add_paths(paths, prefix=None):
                     pass
     else:
         work = ensure_working_copy()
-        r = run_ziptool("add", work, "--prefix", prefix, stdin="\n".join(paths))
+        r = run_ziptool("add", work, "--prefix=%s" % prefix, stdin="\n".join(paths))
         if r.returncode != 0:
             alert("Could not add the selected items.", level="caution")
             return
@@ -563,9 +566,9 @@ def delete_selected():
         return
     work = ensure_working_copy()
     if isdir == "1":
-        r = run_ziptool("delete", work, "--prefix", sel)
+        r = run_ziptool("delete", work, "--prefix=%s" % sel)
     else:
-        r = run_ziptool("delete", work, "--entry", sel)
+        r = run_ziptool("delete", work, "--entry=%s" % sel)
     if r.returncode != 0:
         alert("Could not delete the selected item.", level="caution")
         return
@@ -576,27 +579,145 @@ def delete_selected():
 
 
 # --- Saving ---------------------------------------------------------------
+def _atomic_copy(src, dest):
+    """Copy src onto dest without ever truncating dest in place.
+
+    shutil.copy2 opens the destination "wb", so anything that interrupts the copy
+    - ENOSPC, an I/O error, a crash, a force quit, loss of power - leaves the
+    user's archive truncated and unrecoverable, with the only other instance of
+    the data sitting in a temp dir that cleanup() is about to delete. Write a
+    sibling temp file on the same volume and rename it into place instead: the
+    rename is atomic, and any failure before it leaves the original intact
+    byte for byte. Raises on failure; the caller reports it.
+
+    The destination is resolved first: when the archive path is a symlink the
+    file the user means is its target, and os.replace() would otherwise swap the
+    LINK for a regular file and leave the real archive stale. copy2 followed the
+    link, so resolving keeps that behavior while staying atomic. The temp file
+    must be a sibling of the RESOLVED path, or the rename could cross volumes.
+
+    Deliberate trade-offs of replacing rather than overwriting in place, all
+    accepted because the alternative is a destroyed archive:
+      * the destination gets a NEW inode, so a second hardlink to the archive
+        keeps the old content, and extended attributes that lived on the old
+        inode (Finder tags, Where From, quarantine) are not carried over;
+      * a destination carrying a "deny delete" ACL, or one inside a read-only
+        directory, now fails the save cleanly where copy2 would have succeeded
+        by writing through the existing inode. The original survives and the
+        caller reports the error, which is the right way round."""
+    dest = os.path.realpath(dest)
+    dest_dir = os.path.dirname(dest) or "."
+    fd, tmp = tempfile.mkstemp(prefix=".zipsave-", suffix=".tmp", dir=dest_dir)
+    try:
+        # Write through the mkstemp fd and fsync before the rename: without it,
+        # the rename can reach the disk ahead of the data, so a power loss could
+        # leave a destination that exists but is empty - with the original inode
+        # already gone. open(fd) takes ownership, so fd is not closed separately.
+        with open(fd, "wb") as fdst, open(src, "rb") as fsrc:
+            shutil.copyfileobj(fsrc, fdst)
+            fdst.flush()
+            os.fsync(fdst.fileno())
+        shutil.copystat(src, tmp)
+        os.replace(tmp, dest)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def save_document():
-    """Save to the original path, or chain to Save As for an untitled document."""
+    """Save to the original path, or chain to Save As for an untitled document.
+
+    Returns True only when the document is safely on disk. Callers that discard
+    the working copy afterwards (window close) MUST check it - a False return
+    means the edits still exist only in the temp working copy."""
     orig = get_original()
-    if orig:
-        work = get_work()
-        if work and os.path.isfile(work):
-            shutil.copy2(work, orig)
-        mark_clean()
-        regenerate_model()
-        set_status("Saved %s" % os.path.basename(orig))
-    else:
+    if not orig:
+        # Untitled: omc_next_command only QUEUES Zip.save.as, so the save has not
+        # happened yet. True here means "handed off", not "on disk" - callers must
+        # not take it as licence to delete the working copy. Zip.window.close.py
+        # is safe because it only reaches this branch behind `if get_original()`.
         subprocess.run([NEXT_CMD, CMD_GUID, "Zip.save.as"], capture_output=True)
+        return True
+
+    work = get_work()
+    # An empty work path means the document was never mutated - nothing to write.
+    # A work path whose file has vanished is an error: TMPDIR is purged
+    # periodically, and silently skipping the copy here would mark the document
+    # clean and report "Saved" while every edit is lost.
+    if work and not os.path.isfile(work):
+        log("save: working copy missing at %s" % work)
+        alert("The unsaved changes to “%s” could not be found, so nothing was "
+              "saved. The archive on disk is unchanged." % os.path.basename(orig),
+              level="caution")
+        set_status("Save failed - working copy missing.")
+        # Deliberately NOT calling cleanup() here even though there is nothing
+        # left to preserve: save_document also runs for a plain Cmd-S, where the
+        # window stays open, and cleanup() clears the per-window pasteboard keys
+        # that give the document its identity. Tearing that down under a live
+        # window is worse than leaking a temp dir that is already empty.
+        return False
+    if not work and is_dirty():
+        # Should be unreachable (every mark_dirty() follows ensure_working_copy),
+        # but it is the same silent-success shape as the vanished-copy case, so
+        # refuse rather than report a save that never wrote anything.
+        log("save: document is dirty but has no working copy")
+        alert("The unsaved changes to “%s” could not be found, so nothing was "
+              "saved. The archive on disk is unchanged." % os.path.basename(orig),
+              level="caution")
+        set_status("Save failed - no working copy.")
+        return False
+    if work:
+        try:
+            _atomic_copy(work, orig)
+        except OSError as e:
+            log("save failed: %s" % e)
+            # Name the working copy: the window is closing and cannot be vetoed,
+            # so this path is the user's only route back to the edits.
+            alert("Could not save “%s”.\n\n%s\n\nThe archive on disk is "
+                  "unchanged. Your edited copy is at:\n%s"
+                  % (os.path.basename(orig), e, work), level="caution")
+            set_status("Save failed.")
+            return False
+
+    mark_clean()
+    regenerate_model()
+    set_status("Saved %s" % os.path.basename(orig))
+    return True
 
 
 def save_as(dest):
     if not dest.lower().endswith(".zip"):
         dest += ".zip"
+    # Same guard as save_document, and it matters more here: active_archive()
+    # FALLS BACK to the original when the working copy is missing, so a purged
+    # TMPDIR would silently write the unedited original to the new path and
+    # report success - losing every edit in the one operation users reach for
+    # when they want a safe second copy.
+    work = get_work()
+    if work and not os.path.isfile(work):
+        log("save as: working copy missing at %s" % work)
+        alert("The unsaved changes could not be found, so nothing was saved. "
+              "Nothing was written to “%s”." % os.path.basename(dest),
+              level="caution")
+        set_status("Save failed - working copy missing.")
+        return False
     src = active_archive()
     if not src or not os.path.isfile(src):
+        log("save as: no readable source archive (%r)" % src)
+        alert("There is nothing to save yet.", level="caution")
+        set_status("Save failed - no archive data.")
         return False
-    shutil.copy2(src, dest)
+    try:
+        _atomic_copy(src, dest)
+    except OSError as e:
+        log("save as failed: %s" % e)
+        alert("Could not save to “%s”.\n\n%s" % (os.path.basename(dest), e),
+              level="caution")
+        set_status("Save failed.")
+        return False
     pb_set(PB_ORIGINAL, dest)
     # The working copy (if any) now corresponds to dest; keep editing it.
     mark_clean()
@@ -621,13 +742,13 @@ def do_extract():
     if not arc or not dest:
         return
 
-    args = ["extract", arc, "--dest", dest]
+    args = ["extract", arc, "--dest=%s" % dest]
     if mode == "all":
         args.append("--all")
     elif pb_get(PB_SEL_ISDIR) == "1":
-        args += ["--prefix", pb_get(PB_SEL_PATH)]
+        args += ["--prefix=%s" % pb_get(PB_SEL_PATH)]
     else:
-        args += ["--entry", pb_get(PB_SEL_PATH)]
+        args += ["--entry=%s" % pb_get(PB_SEL_PATH)]
 
     pw = pb_get(PB_PASSWORD)
     if enc == "encrypted" and not pw:
@@ -638,21 +759,24 @@ def do_extract():
     if pw:
         args.append("--pwd-stdin")
     # ziptool streams "file N of M" progress lines to stdout (parsed live by OMC's
-    # PROGRESS) and writes its "<count>\t<top-level path created>" summary to this
-    # result file. The path is Finder-style: auto-renamed if a same-name item
+    # PROGRESS) and writes its "<count>\t<top-level path>\t<skipped>" summary to
+    # this result file. The path is Finder-style: auto-renamed if a same-name item
     # already existed.
     rf = tempfile.NamedTemporaryFile(prefix="zipresult-", delete=False)
     rf_path = rf.name
     rf.close()
-    args += ["--result-file", rf_path]
+    args += ["--result-file=%s" % rf_path]
     r = run_ziptool(*args, stdin=(pw or None), stream_stdout=True)
     rc = r.returncode
-    count, root = 0, dest
+    count, root, skipped = 0, dest, 0
     try:
         with open(rf_path, "r", encoding="utf-8") as f:
             parts = f.read().strip().split("\t")
-        if len(parts) == 2 and parts[0].isdigit():
+        # Tolerate the older 2-field summary as well as the 3-field one.
+        if len(parts) >= 2 and parts[0].isdigit():
             count, root = int(parts[0]), parts[1]
+        if len(parts) >= 3 and parts[2].isdigit():
+            skipped = int(parts[2])
     except OSError:
         pass
     finally:
@@ -660,7 +784,10 @@ def do_extract():
             os.remove(rf_path)
         except OSError:
             pass
-    if rc == 0:
+    # rc 5 means a PARTIAL extraction: entries were rejected (unsafe path, name
+    # collision) but everything else is on disk and placed. Report it as a
+    # success that names its own shortfall - never as a clean, complete run.
+    if rc in (0, 5):
         if mode == "all":
             base = os.path.basename(arc)
             intended = base[:-4] if base.lower().endswith(".zip") else base
@@ -669,12 +796,25 @@ def do_extract():
         msg = "Extracted %d item%s to %s" % (count, "" if count == 1 else "s", root)
         if os.path.basename(root) != intended:
             msg += "  (renamed to avoid overwriting)"
+        if skipped:
+            msg += "  - %d entr%s skipped" % (skipped, "y" if skipped == 1 else "ies")
         set_status(msg)
         # Transient toast acknowledges the quick action and offers Reveal; no
         # notification (that is for background work the user has looked away from).
         pb_set(PB_EX_LAST, root)
         toast = "Extracted %d item%s" % (count, "" if count == 1 else "s")
+        if skipped:
+            toast += ", %d skipped" % skipped
         present_toast(toast, 6, "Show in Finder", "Zip.reveal")
+        if skipped:
+            # The helper named each rejected entry on stderr; keep it for the log
+            # so "which ones?" is answerable after the fact.
+            log((r.stderr or b"").decode("utf-8", "replace"))
+            alert("%d entr%s could not be extracted and %s skipped. Everything "
+                  "else was extracted to “%s”."
+                  % (skipped, "y" if skipped == 1 else "ies",
+                     "was" if skipped == 1 else "were", os.path.basename(root)),
+                  level="caution")
     elif rc == 2:
         pb_set(PB_PASSWORD, "")
         set_status("Incorrect password.")
@@ -683,6 +823,10 @@ def do_extract():
         alert("This archive uses an unsupported compression or encryption method.", level="caution")
         set_status("Unsupported method.")
     else:
+        # stream_stdout captures the helper's stderr into r.stderr; without this
+        # the "see log" advice pointed at a log that never received anything.
+        log("extract failed (rc=%s): %s"
+            % (rc, (r.stderr or b"").decode("utf-8", "replace")))
         alert("Extraction failed. See log for details.", level="caution")
         set_status("Extraction failed.")
 
@@ -717,7 +861,7 @@ def validate_password(pw):
     entry = first_encrypted_entry()
     if not entry:
         return True
-    r = run_ziptool("read", active_archive(), "--entry", entry, "--max", "1",
+    r = run_ziptool("read", active_archive(), "--entry=%s" % entry, "--max=1",
                     "--pwd-stdin", stdin=pw)
     return r.returncode == 0
 

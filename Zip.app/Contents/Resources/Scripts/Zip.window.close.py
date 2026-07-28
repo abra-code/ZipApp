@@ -11,8 +11,13 @@ if is_dirty():
                title="Unsaved Changes", level="caution", ok="Save", cancel="Don’t Save")
     if rc == 0:  # Save
         if get_original():
-            save_document()
-            cleanup()
+            # cleanup() deletes the working copy, so it may only run once the
+            # save is known to have succeeded. On failure save_document has
+            # already told the user why; leaving the temp dir and the pasteboard
+            # state in place keeps the edits recoverable instead of discarding
+            # them behind a dialog the user cannot act on.
+            if save_document():
+                cleanup()
         else:
             # New, unsaved: chain to Save As and let it clean up afterward.
             pb_set(PB_CLOSE_AFTER_SAVE, "1")

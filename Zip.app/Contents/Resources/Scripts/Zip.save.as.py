@@ -17,9 +17,9 @@ if not dest:
     sys.exit(0)
 
 ok = save_as(dest)
-if closing:
+if ok and closing:
     cleanup()
 elif ok:
     refresh_title()
-else:
-    set_status("Save failed")
+# A failed save keeps the working copy and the pasteboard state: cleanup() would
+# throw the document away, and save_as has already reported what went wrong.
