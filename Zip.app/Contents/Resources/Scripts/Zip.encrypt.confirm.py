@@ -25,5 +25,10 @@ if pw != confirm:
     sys.exit(0)
 
 dismiss_modal()
+# do_recrypt alerts with the reason on failure, but the sheet is already gone by
+# then, so without an else the user was left with no sheet, no error and an
+# unchanged archive - looking exactly like success.
 if do_recrypt("aes256", pw):
     set_status("Archive encrypted (AES-256) - Save to keep it.")
+else:
+    set_status("Encryption failed - the archive is unchanged.")

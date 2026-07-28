@@ -18,5 +18,9 @@ if alert("Remove encryption from this archive?\nAnyone will be able to read it."
     set_status("Encryption kept.")
     sys.exit(0)
 
+# Same as encrypt.confirm: the confirmation dialog is gone by the time this
+# runs, so a silent failure is indistinguishable from success.
 if do_recrypt("none", ""):
     set_status("Encryption removed - Save to keep it.")
+else:
+    set_status("Could not remove encryption - the archive is unchanged.")

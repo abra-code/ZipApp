@@ -239,10 +239,17 @@ def get_view_value(view_id):
 
 
 # --- ziptool wrapper ------------------------------------------------------
-def run_ziptool(*args, stdin=None, capture=True, stream_stdout=False):
+def run_ziptool(*args, stdin=None, capture=True, stream_stdout=False,
+                discard_stdout=False):
     cmd = [PYTHON3, ZIPTOOL] + [str(a) for a in args]
     log("ziptool: %s" % " ".join(cmd))
     inp = stdin.encode("utf-8", "surrogateescape") if stdin else None
+    if discard_stdout:
+        # For reads done purely to verify (password checking): the helper streams
+        # the entry to fd 1, so capturing it would buffer the whole entry in
+        # memory for output nobody looks at.
+        return subprocess.run(cmd, input=inp, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.PIPE, text=False)
     if stream_stdout:
         # Let ziptool's stdout reach our own stdout (fd 1) untouched so OMC's
         # PROGRESS parser sees the live "file N of M" lines; capture stderr only.
@@ -559,17 +566,18 @@ def _read_model_rows():
             for i in range(0, len(fields) - (MODEL_COLS - 1), MODEL_COLS)]
 
 
-def _status_summary(verb):
+def _status_summary(verb, note=""):
     n = len(_read_model_rows())
     enc = pb_get(PB_ENC)
     # libarchive does not expose the cipher (AES vs ZipCrypto) on read, so the
     # status reports encryption generically.
-    note = " - encrypted" if enc == "encrypted" else ""
-    set_status("%s %s - %d entries%s" % (verb, doc_name(), n, note))
+    enc_note = " - encrypted" if enc == "encrypted" else ""
+    set_status("%s %s - %d entries%s%s" % (verb, doc_name(), n, enc_note, note))
 
 
 # --- Mutations ------------------------------------------------------------
 def add_paths(paths, prefix=None):
+    recrypted_note = False
     if prefix is None:
         prefix = cur_prefix()
 
@@ -602,6 +610,7 @@ def add_paths(paths, prefix=None):
                 alert("Could not add the selected items.", level="caution")
                 return
             os.replace(recrypted, work)   # atomic: working copy is fully encrypted again
+            recrypted_note = True
         finally:
             for tmp in (scratch, recrypted):
                 try:
@@ -618,7 +627,15 @@ def add_paths(paths, prefix=None):
     mark_dirty()
     regenerate_model()
     populate_level(cur_prefix())
-    _status_summary("Added to")
+    if recrypted_note:
+        # The whole archive is rewritten as AES-256 regardless of what it was
+        # before, so a ZipCrypto archive gets silently upgraded - a security
+        # improvement, but a compatibility change worth saying out loud. Setting
+        # this inside the branch above meant _status_summary overwrote it before
+        # the user could read it.
+        _status_summary("Added to", note=" - re-encrypted (AES-256)")
+    else:
+        _status_summary("Added to")
 
 
 def delete_selected():
@@ -961,21 +978,66 @@ def refresh_lock_menu():
     enable_view(ID_REMOVE_ENC, is_enc and unlocked)
 
 
+# Above this size the check falls back to the format's verification byte. Set
+# high deliberately: for a STORED (uncompressed) entry that fallback is still
+# ~1/256 on ZipCrypto, and stored is exactly what large entries are - jpg, mp4,
+# nested zips - so a low cap missed the archives it was meant to help. A full
+# read plus CRC of a 4 MB AES entry measures 0.08 s, so the ceiling can be high.
+VALIDATE_FULL_READ_MAX = 256 * 1024 * 1024
+
+
+# CRC-32 only reaches full strength at 4 bytes, and a ZERO-byte entry's CRC is 0
+# - it matches any key, so reading one "in full" proves nothing beyond the
+# format's check byte. Entries below this are never chosen as the validation
+# target when a better one exists.
+MIN_VERIFIABLE_SIZE = 4
+
+
 def first_encrypted_entry():
-    """Full path of the first encrypted file entry in the cached model, or None."""
+    """(path, size) of the encrypted entry that is cheapest to read AMONG THOSE A
+    FULL READ ACTUALLY VERIFIES, or (None, 0).
+
+    Picking the plain smallest entry defeated the whole point: it lands on the
+    0-byte .gitkeep / empty __init__.py that most trees contain, whose CRC check
+    is vacuous - measured at 14 wrong passwords accepted out of 2999. Entries
+    below MIN_VERIFIABLE_SIZE, and rows whose size will not parse, are kept only
+    as a last resort."""
+    best, best_size = None, None
+    fallback, fallback_size = None, 0
     for parts in _read_model_rows():
-        if len(parts) >= 6 and parts[1] == "0" and parts[5] == "1":
-            return parts[0]
-    return None
+        if len(parts) < 6 or parts[1] != "0" or parts[5] != "1":
+            continue
+        try:
+            size = int(parts[2])
+        except (TypeError, ValueError):
+            size = None            # unknown: must never win the comparison
+        if size is not None and size >= MIN_VERIFIABLE_SIZE:
+            if best is None or size < best_size:
+                best, best_size = parts[0], size
+        elif fallback is None:
+            fallback, fallback_size = parts[0], size or 0
+    if best is not None:
+        return (best, best_size)
+    return (fallback, fallback_size) if fallback else (None, 0)
 
 
 def validate_password(pw):
-    """True if pw decrypts an encrypted entry (or nothing is encrypted)."""
-    entry = first_encrypted_entry()
+    """True if pw decrypts an encrypted entry (or nothing is encrypted).
+
+    Reads the chosen entry IN FULL so libarchive verifies the CRC (and, for
+    WinZip AES, the HMAC). Reading a single byte only exercised the format's
+    verification byte, which is 1 byte for ZipCrypto - so roughly 1 wrong
+    password in 256 was accepted, the app reported "unlocked", and the failure
+    surfaced later as a confusing extraction error. Entries above
+    VALIDATE_FULL_READ_MAX keep the cheap check rather than stall the UI."""
+    entry, size = first_encrypted_entry()
     if not entry:
         return True
-    r = run_ziptool("read", active_archive(), "--entry=%s" % entry, "--max=1",
-                    "--pwd-stdin", stdin=pw)
+    args = ["read", active_archive(), "--entry=%s" % entry, "--pwd-stdin"]
+    if size > VALIDATE_FULL_READ_MAX:
+        args.append("--max=1")
+    # stdout goes to /dev/null: this reads for verification, not for content.
+    r = run_ziptool(*args, stdin=pw, discard_stdout=True)
     return r.returncode == 0
 
 
@@ -1007,10 +1069,17 @@ def do_recrypt(mode, new_pw):
     r = _run_recrypt(work, dest, mode,
                      old_pw if enc == "encrypted" else None,
                      new_pw if mode != "none" else None)
-    if r.returncode == 2:
-        alert("Incorrect password.", level="caution")
-        return False
     if r.returncode != 0:
+        # A failed recrypt leaves a partial <work>.recrypt behind; the helper
+        # writes as it goes and cannot unwind. Remove it rather than leaving a
+        # truncated archive next to the working copy.
+        try:
+            os.remove(dest)
+        except OSError:
+            pass
+        if r.returncode == 2:
+            alert("Incorrect password.", level="caution")
+            return False
         log("recrypt failed: %s" % (r.stderr or b"").decode("utf-8", "replace"))
         alert("Could not change the archive encryption.", level="caution")
         return False

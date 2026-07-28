@@ -91,9 +91,12 @@ def _archive_read(archive, entry, maxbytes, pwd):
     cmd = [ARCHIVE_BIN, "read", archive, entry]
     if maxbytes and maxbytes > 0:
         cmd += ["--max", str(maxbytes)]
-    r = subprocess.run(cmd, input=(pwd or b""), capture_output=True)
-    if r.stdout:
-        sys.stdout.buffer.write(r.stdout)
+    # The helper writes straight to our stdout instead of being captured: with
+    # capture_output the whole entry was buffered in memory, which is unbounded
+    # when --max is absent. Flush first so our own buffered output cannot land
+    # after the child's.
+    sys.stdout.flush()
+    r = subprocess.run(cmd, input=(pwd or b""), stdout=None, stderr=subprocess.PIPE)
     if r.returncode != 0 and r.stderr:
         sys.stderr.buffer.write(r.stderr)
     return r.returncode
@@ -419,6 +422,12 @@ def _unique_in(dest, name, is_dir):
 
 
 def cmd_extract(args):
+    # Mirror the helper's prefix rule: it now requires a path boundary, so
+    # without this the Python-side count would include "docs2/..." for
+    # "--prefix docs" while the helper correctly skipped it, and the progress
+    # total would never be reached.
+    if getattr(args, "prefix", None) and not args.prefix.endswith("/"):
+        args.prefix += "/"
     pwd = read_password(args.pwd_stdin)
     dest = os.path.abspath(args.dest)
     os.makedirs(dest, exist_ok=True)
@@ -566,7 +575,12 @@ def cmd_extract(args):
         else:
             safe = sanitize_rel(args.entry)
             src_top = os.path.join(tmproot, safe) if safe else None
-        if count > 0 and src_top and os.path.lexists(src_top) and unique_top:
+        # Placement must NOT be gated on `count`, which counts files only: a
+        # selection that is entirely directories (an empty folder) extracted
+        # correctly into the staging dir and was then deleted by the finally
+        # below, so the user got rc 1 and nothing on disk.
+        placed = bool(src_top and os.path.lexists(src_top) and unique_top)
+        if placed:
             final = os.path.join(dest, unique_top)
             try:
                 os.rename(src_top, final)
@@ -588,7 +602,7 @@ def cmd_extract(args):
     eprint("extracted %d item(s) to %s" % (count, root))
     if skipped:
         eprint("%d entr%s could not be extracted" % (skipped, "y" if skipped == 1 else "ies"))
-    if count == 0:
+    if count == 0 and not placed:
         eprint("nothing matched")
         return 1
     # Machine-readable summary: "<count>\t<top-level path created>\t<skipped>".
@@ -651,6 +665,13 @@ def _additions_from_sources(sources, prefix):
                     if os.path.islink(full):
                         rel = os.path.relpath(full, parent)
                         pairs.append((full, prefix + rel.replace(os.sep, "/")))
+                # An empty directory has no file to imply it, so without this it
+                # vanished from the archive and the add still reported success.
+                # Staging recreates the directory and Info-ZIP stores it, which
+                # matters for project trees and bundles that rely on the shape.
+                if not dirs and not files:
+                    rel = os.path.relpath(root, parent)
+                    pairs.append((root, prefix + rel.replace(os.sep, "/")))
         else:
             pairs.append((src, prefix + base))
     return pairs
@@ -679,6 +700,18 @@ def cmd_add(args):
             if os.path.islink(full):
                 os.symlink(os.readlink(full), dst)
                 continue
+            if os.path.isdir(full):
+                # exist_ok tolerates an existing DIRECTORY only; a file already
+                # staged under this name would otherwise raise, and the reverse
+                # order silently copied the file INTO the directory ("foo/foo").
+                if os.path.lexists(dst) and not os.path.isdir(dst):
+                    eprint("skip: %s collides with a file of the same name" % arc)
+                    continue
+                os.makedirs(dst, exist_ok=True)   # empty dir: shape only, no data
+                continue
+            if os.path.isdir(dst) and not os.path.islink(dst):
+                eprint("skip: %s collides with a folder of the same name" % arc)
+                continue
             try:
                 os.link(full, dst)
             except OSError:
@@ -691,7 +724,7 @@ def cmd_add(args):
             return 1
     finally:
         shutil.rmtree(staging, ignore_errors=True)
-    eprint("added %d file(s)" % len(to_add))
+    eprint("added %d item(s)" % len(to_add))
     return 0
 
 

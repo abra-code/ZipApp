@@ -145,11 +145,20 @@ static int is_dot_underscore(const char *raw)
     return (len - start) >= 2 && name[start] == '.' && name[start + 1] == '_';
 }
 
-/* True when <name> (normalized) starts with <prefix>; NULL prefix matches all. */
+/* True when <name> (normalized) is <prefix> or lies under it; NULL matches all.
+ * The match must end at a path boundary: a bare strncmp let "--prefix docs"
+ * pull in "docs2/b.txt", so extracting one folder could silently drag in a
+ * sibling whose name merely starts the same way. */
 static int prefix_match(const char *name, const char *prefix)
 {
     if (prefix == NULL) return 1;
-    return strncmp(norm(name), prefix, strlen(prefix)) == 0;
+    const char *n = norm(name);
+    size_t pl = strlen(prefix);
+    if (strncmp(n, prefix, pl) != 0)
+        return 0;
+    if (pl == 0 || prefix[pl - 1] == '/')
+        return 1;                       /* prefix already ends at a boundary */
+    return n[pl] == '\0' || n[pl] == '/';
 }
 
 /* Distinguish a wrong/missing passphrase from other libarchive failures. */
@@ -197,7 +206,14 @@ static int cmd_read(const char *path, const char *entry, long long maxbytes, con
             size_t want = (size_t)n;
             if (maxbytes > 0 && written + (long long)want > maxbytes)
                 want = (size_t)(maxbytes - written);
-            fwrite(buf, 1, want, stdout);
+            /* A short write means the consumer went away or the pipe filled and
+             * failed; reporting success would hand the caller a silently
+             * truncated preview. */
+            if (fwrite(buf, 1, want, stdout) != want) {
+                fprintf(stderr, "archive: short write to stdout\n");
+                rc = 1;
+                break;
+            }
             written += (long long)want;
             if (maxbytes > 0 && written >= maxbytes)
                 break;
@@ -213,7 +229,13 @@ static int cmd_read(const char *path, const char *entry, long long maxbytes, con
     if (rc == 1 && r == ARCHIVE_EOF)
         fprintf(stderr, "archive: no such entry: %s\n", entry);
 
-    fflush(stdout);
+    /* fwrite into a stdio FILE only fails once the buffer flushes, so an entry
+     * whose tail fits in the buffer is written entirely by this flush - its
+     * return is the only place that failure can surface. */
+    if (fflush(stdout) != 0 || ferror(stdout)) {
+        fprintf(stderr, "archive: could not flush stdout\n");
+        if (rc == 0) rc = 1;
+    }
     archive_read_close(a);
     archive_read_free(a);
     return rc;
@@ -564,6 +586,7 @@ static int cmd_recrypt(const char *src, const char *dst, const char *mode,
     archive_write_free(w);
     archive_read_close(a);
     archive_read_free(a);
+    if (rc != 0) unlink(dst);          /* same reason as cmd_create */
     if (rc == 0)
         fprintf(stderr, "archive: rewrote %d entr%s -> %s (%s)\n",
                 count, count == 1 ? "y" : "ies", dst, mode);
@@ -626,9 +649,24 @@ static int cmd_create(const char *dst, const char *manifest, const char *mode, c
             if (in == NULL) { fprintf(stderr, "archive: cannot open %s\n", srcpath); archive_entry_free(e); rc = 1; break; }
             size_t got;
             while ((got = fread(buf, 1, sizeof buf, in)) > 0) {
-                if (archive_write_data(w, buf, got) < 0) {
-                    fprintf(stderr, "archive: write data: %s\n", archive_error_string(w)); rc = 1; break;
+                la_ssize_t nw = archive_write_data(w, buf, got);
+                if (nw < 0) {
+                    const char *em = archive_error_string(w);
+                    fprintf(stderr, "archive: write data: %s\n", em ? em : "unknown error");
+                    rc = 1; break;
                 }
+                /* nw < got is NOT truncation here: libarchive's zip writer clamps
+                 * each write to the size declared from lstat, so a source file
+                 * that grew after we stat'd it returns a short count with no
+                 * error set. The excess is dropped and the entry still matches
+                 * its declared size. Treating that as failure aborted the whole
+                 * create on a perfectly ordinary growing file. */
+            }
+            /* fread returning 0 means EOF *or* error, and treating an I/O error
+             * as a clean EOF stored a truncated entry and still exited 0. */
+            if (rc == 0 && ferror(in)) {
+                fprintf(stderr, "archive: read error on %s\n", srcpath);
+                rc = 1;
             }
             fclose(in);
             if (rc != 0) { archive_entry_free(e); break; }
@@ -639,6 +677,9 @@ static int cmd_create(const char *dst, const char *manifest, const char *mode, c
     if (mf != NULL) fclose(mf);
     if (archive_write_close(w) != ARCHIVE_OK && rc == 0) rc = 1;
     archive_write_free(w);
+    /* Never leave a half-written archive behind for the caller to mistake for a
+     * real one - the same cleanup do_recrypt does on the Python side. */
+    if (rc != 0) unlink(dst);
     if (rc == 0)
         fprintf(stderr, "archive: created %s with %d file(s) (%s)\n", dst, count, mode);
     return rc;
