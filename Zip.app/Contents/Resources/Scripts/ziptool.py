@@ -393,7 +393,7 @@ def cmd_read(args):
 # archive. Names already in an archive are never rewritten - listing, matching
 # and deleting all still work on the exact bytes the archive holds.
 #
-# These two functions mirror archive.c's repair_component() byte for byte.
+# These two functions mirror archive.cpp's repair_component() byte for byte.
 # Python decodes entry names with surrogateescape, so each byte that is not
 # valid UTF-8 arrives as one lone surrogate - the same unit the C side replaces.
 
@@ -409,7 +409,7 @@ def _is_noncharacter(ch):
 def repair_component(c):
     """One path component with TAB/CR/LF folded to a space and every byte that
     is not well-formed UTF-8 folded to '_'. One surrogate is one such byte,
-    which is what makes this match archive.c's repair_component exactly."""
+    which is what makes this match archive.cpp's repair_component exactly."""
     out = []
     for ch in c:
         if ch in "\t\r\n":
@@ -775,7 +775,7 @@ def _fold(s):
 
 def _unique_arc(prefix, cand, batch, existing, is_dir):
     """Finder-style free variant of <cand> within the archive: 'name', then
-    'name 2', 'name 3'. Mirrors _unique_in and archive.c's unique_name. Avoids
+    'name 2', 'name 3'. Mirrors _unique_in and archive.cpp's unique_name. Avoids
     both what this operation has already assigned and what the archive already
     holds - an invented name must never land on either."""
     def free(x):

@@ -42,6 +42,9 @@ staged paths afterwards (see `Scripts/ziptool.py`).
 ./build.sh install    # also copy into ../Zip.app/Contents/Helpers/archive
 ```
 
+The source is C++17 (`clang++ -std=c++17`), with no dependency beyond the
+system `libarchive` and the standard library.
+
 After `install`, re-seal the app so the bundle signature covers the new binary:
 
 ```
@@ -52,10 +55,11 @@ appletbuilder build ../Zip.app
 
 - The macOS SDK ships no public `archive.h`, so libarchive 3.7.4's public
   headers (`archive.h`, `archive_entry.h`, BSD 2-clause) are vendored here next
-  to `archive.c`. They match the system dylib version (`libarchive 3.7.4`, shipped
+  to `archive.cpp`. They match the system dylib version (`libarchive 3.7.4`, shipped
   with macOS 14.6+). We still link the *system* library via the SDK's
   `libarchive.tbd` stub (`-larchive`) - only the declarations are vendored, and
-  `archive` does not bundle libarchive itself.
+  `archive` does not bundle libarchive itself. Both headers carry their own
+  `extern "C"` guards, so the C++ source includes them unmodified.
 - To refresh the headers for a newer macOS libarchive, copy `archive.h` and
   `archive_entry.h` from the matching libarchive release tarball
   (https://www.libarchive.org/downloads/) - the version the system reports via

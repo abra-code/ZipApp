@@ -8,11 +8,12 @@
 #                         codesign), when the AppletBuilder CLI can be found
 #
 # archive links the system libarchive via the SDK's libarchive.tbd stub. No public
-# archive.h ships in the SDK, so archive.c declares the small ABI subset it uses.
+# archive.h ships in the SDK, so libarchive's own headers are vendored next to
+# the source; they carry extern "C" guards, so C++ includes them unchanged.
 set -e
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-SRC="$HERE/archive.c"
+SRC="$HERE/archive.cpp"
 OUTDIR="$HERE/build"
 OUT="$OUTDIR/archive"
 APP="$HERE/../Zip.app"
@@ -21,7 +22,8 @@ SDK="$(xcrun --show-sdk-path)"
 mkdir -p "$OUTDIR"
 
 echo "Compiling universal archive (arm64 + x86_64)..."
-clang -arch arm64 -arch x86_64 \
+clang++ -arch arm64 -arch x86_64 \
+      -std=c++17 \
       -O2 -Wall -Wextra \
       -mmacosx-version-min=14.6 \
       -isysroot "$SDK" \
