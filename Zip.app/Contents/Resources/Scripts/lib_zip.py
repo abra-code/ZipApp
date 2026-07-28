@@ -569,12 +569,25 @@ def delete_selected():
         r = run_ziptool("delete", work, "--prefix=%s" % sel)
     else:
         r = run_ziptool("delete", work, "--entry=%s" % sel)
-    if r.returncode != 0:
+    # rc 5 means the archive WAS modified but not exactly as asked. Treating that
+    # as a plain failure left the table showing rows that no longer exist and,
+    # worse, skipped mark_dirty() - so closing the window silently discarded a
+    # mutation the user had been told did not happen.
+    if r.returncode not in (0, 5):
+        log("delete failed: %s" % (r.stderr or b"").decode("utf-8", "replace"))
         alert("Could not delete the selected item.", level="caution")
         return
     mark_dirty()
     regenerate_model()
     populate_level(pb_get(PB_PREFIX))
+    if r.returncode == 5:
+        detail = (r.stderr or b"").decode("utf-8", "replace").strip()
+        log("partial delete: %s" % detail)
+        alert("The archive was changed, but not exactly as requested. Check the "
+              "contents before saving.\n\n%s" % detail.split("\n")[-1],
+              level="caution")
+        set_status("Delete completed with problems - check before saving.")
+        return
     _status_summary("Updated")
 
 
@@ -691,6 +704,28 @@ def save_document():
 def save_as(dest):
     if not dest.lower().endswith(".zip"):
         dest += ".zip"
+        # NSSavePanel ran its overwrite check against the name the user typed,
+        # not against this one. Appending the extension can land on a DIFFERENT
+        # existing file that the user was never asked about - typing "backup"
+        # when "backup.zip" exists silently replaced it. Ask now. lexists, so a
+        # symlink occupying the name counts.
+        if os.path.lexists(dest):
+            if os.path.isdir(dest) and not os.path.islink(dest):
+                alert("“%s” is a folder and cannot be replaced. Choose another name."
+                      % os.path.basename(dest), title="Cannot Save", level="caution")
+                set_status("Save cancelled - that name is a folder.")
+                return False
+            # _atomic_copy follows symlinks, so the file actually replaced may
+            # live somewhere else entirely. Name what really gets overwritten.
+            real = os.path.realpath(dest)
+            what = os.path.basename(dest)
+            if os.path.islink(dest):
+                what = "%s (which points to %s)" % (os.path.basename(dest), real)
+            if alert("“%s” already exists. Do you want to replace it?" % what,
+                     title="Replace File", level="caution",
+                     ok="Replace", cancel="Cancel") != 0:
+                set_status("Save cancelled")
+                return False
     # Same guard as save_document, and it matters more here: active_archive()
     # FALLS BACK to the original when the working copy is missing, so a purged
     # TMPDIR would silently write the unedited original to the new path and
@@ -723,6 +758,27 @@ def save_as(dest):
     mark_clean()
     set_status("Saved %s" % os.path.basename(dest))
     return True
+
+
+def offer_recovery(path, message):
+    """Point the user at a working copy that is about to be orphaned.
+
+    Zip.window.close is the window's END_CANCEL_SUBCOMMAND_ID - a notification
+    fired as the window goes away, not a veto - so a close cannot be called off.
+    When the document was not saved, the honest move is to keep the working copy
+    and say where it is; Reveal is the only practical way back to a TMPDIR path.
+    Does nothing (so the caller can call it unconditionally) if there is no file
+    left to point at."""
+    if not path or not os.path.isfile(path):
+        return
+    # Say "temporary" plainly: this lives under TMPDIR, which macOS sweeps after
+    # a few days. Promising a kept copy without that caveat would recreate the
+    # very "purged TMPDIR = lost edits" trap that issue 4 was about.
+    rc = alert("%s\n\nA temporary copy of your changes is here - move it "
+               "somewhere safe to keep it:\n%s" % (message, path),
+               title="Not Saved", level="caution", ok="Show in Finder", cancel="OK")
+    if rc == 0:
+        subprocess.run(["/usr/bin/open", "-R", path], capture_output=True)
 
 
 def cleanup():

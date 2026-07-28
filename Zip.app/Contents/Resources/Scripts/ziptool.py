@@ -74,11 +74,18 @@ def _archive_read(archive, entry, maxbytes, pwd):
     return r.returncode
 
 
-def _archive_list(archive):
+def _archive_list(archive, raw=False):
     """Run the helper's `list`; return rows [(path, isdir, size, mtime, enc, ad)]
     or None on error. Encryption is a boolean (libarchive does not expose the
     cipher); ad is "1" for a "._*" file confirmed (or, when encrypted, presumed)
-    to be an AppleDouble sidecar. Readable without a password."""
+    to be an AppleDouble sidecar. Readable without a password.
+
+    raw=True skips OUR normalization (stripping a leading "./") so mutation can
+    address entries closer to their stored name. It is NOT a stored-name oracle:
+    libarchive itself still rewrites some names on the way out - a directory
+    entry stored without a trailing slash is reported with one, and a "\\" in a
+    name with no "/" is reported as "/" (a DOS-path heuristic). Callers must
+    verify the effect of a mutation rather than assume the name matched."""
     r = subprocess.run([ARCHIVE_BIN, "list", archive], input=b"", capture_output=True)
     if r.returncode != 0:
         if r.stderr:
@@ -94,7 +101,7 @@ def _archive_list(archive):
         # Normalize a leading "./" here, at the single entry point of archive
         # names into the model, so matching/counting agrees with the helper's
         # norm()-based comparisons for bsdtar-style "./name" archives.
-        if parts[0].startswith("./"):
+        if not raw and parts[0].startswith("./"):
             parts[0] = parts[0][2:]
         rows.append(parts[:6])
     return rows
@@ -625,7 +632,7 @@ def cmd_add(args):
 
 
 def zip_pattern(name):
-    r"""Escape Info-ZIP's glob metacharacters so `zip -d` matches <name> literally.
+    r"""Escape Info-ZIP's pattern metacharacters so `zip -d` matches <name> literally.
 
     zip -d takes PATTERNS, not names. An entry whose stored name contains *, ?
     or [ would otherwise take its siblings with it: `zip -d a.zip 'a?c.txt'`
@@ -635,29 +642,131 @@ def zip_pattern(name):
     It does make *, [ and \ literal for -d, but ? still globs (verified both
     orderings, with and without --), so -nw alone would silently reinstate the
     single-character-wildcard case. Backslash-escaping covers all of them; \ is
-    escaped first, which the per-character map does for free."""
-    return "".join("\\" + ch if ch in "\\[]*?" else ch for ch in name)
+    escaped first, which the per-character map does for free.
+
+    "/" is escaped too, and that is what makes bsdtar-style archives reachable.
+    zip strips a leading "./" from the PATTERN but not from the stored name, so
+    neither "foo.txt" nor "./foo.txt" matches a stored "./foo.txt" - the entry
+    was simply undeletable. Escaping the slash (".\/foo.txt") suppresses that
+    normalization and matches exactly. It is harmless for ordinary names."""
+    return "".join("\\" + ch if ch in "\\[]*?/" else ch for ch in name)
+
+
+def _resolve_targets(rows, entry, prefix):
+    """Map a model name onto the archive's ACTUAL listed names.
+
+    The model normalizes a leading "./" away, so the name the UI sends never
+    matched a bsdtar-style archive and the delete silently did nothing. Going
+    through the real listing fixes that, lets every descendant be named
+    literally instead of globbed with "prefix*", and gives the caller a way to
+    tell "nothing matched" apart from "matched and deleted". Returns a list of
+    (listed_name, isdir) pairs."""
+    # An empty prefix would make every startswith() true and wipe the archive.
+    if entry is None and not prefix:
+        return []
+    # A prefix must end at a path boundary or "sub" would swallow "sub2/...".
+    # In-app callers always pass the model's trailing slash; a CLI caller may not.
+    if prefix and not prefix.endswith("/"):
+        prefix += "/"
+    targets = []
+    for name, isdir, _sz, _mt, _enc, _ad in rows:
+        norm = name[2:] if name.startswith("./") else name
+        if entry is not None:
+            # Exact match. Comparing rstrip("/") on both sides would make a file
+            # "sub" and a directory marker "sub/" collide, so deleting either one
+            # destroyed the other.
+            if norm == entry:
+                targets.append((name, isdir))
+        elif norm.startswith(prefix):
+            # The folder marker "sub/" and every descendant.
+            targets.append((name, isdir))
+        elif isdir == "1" and norm.rstrip("/") == prefix.rstrip("/"):
+            # The folder's own marker when it is reported without a trailing
+            # slash. Gated on isdir so a same-named FILE is never swept up.
+            targets.append((name, isdir))
+    return targets
 
 
 def cmd_delete(args):
-    if args.entry is not None:
-        targets = [zip_pattern(args.entry)]
-    elif args.prefix is not None:
-        # Folder marker + descendants. The prefix itself is escaped so its own
-        # metacharacters stay literal; the trailing "*" is the one wildcard we
-        # actually want (Info-ZIP matches it across "/").
-        targets = [zip_pattern(args.prefix), zip_pattern(args.prefix) + "*"]
-    else:
+    if args.entry is None and args.prefix is None:
         eprint("need --entry or --prefix")
         return 1
-    # "--" ends zip's option parsing so an entry named "-r" or "-@" is treated as
-    # a name, not a flag. It does not disable wildcards, so the prefix form's
-    # deliberate trailing "*" still matches descendants.
-    r = subprocess.run(["/usr/bin/zip", "-d", args.archive, "--"] + targets,
-                       capture_output=True, text=True)
-    if r.returncode != 0 and "Nothing to do" not in (r.stdout + r.stderr):
-        eprint(r.stderr.strip() or r.stdout.strip())
+    rows = _archive_list(args.archive, raw=True)
+    if rows is None:
+        return 4
+    targets = _resolve_targets(rows, args.entry, args.prefix)
+    if not targets:
+        eprint("nothing matched")
         return 1
+
+    listed_names = set(n for n, *_ in rows)
+    patterns = []
+    for name, isdir in targets:
+        patterns.append(zip_pattern(name))
+        # libarchive REPORTS directory entries with a trailing "/" even when the
+        # archive stores them without one, so the listed name is not always the
+        # stored name. Offer the slash-less spelling too - but only when no other
+        # entry already owns it, or deleting the folder "sub/" would also match a
+        # sibling FILE literally named "sub". An unmatched extra pattern is just
+        # a warning, and the verification below is what decides success.
+        if isdir == "1" and name.endswith("/") and name[:-1] not in listed_names:
+            patterns.append(zip_pattern(name[:-1]))
+    # Names normally go on argv after "--", which ends zip's option parsing so an
+    # entry called "-r" or "-@" is a name and not a flag. A large folder can
+    # exceed ARG_MAX, so past a threshold they go on stdin via -@ instead, which
+    # honors the same escaping.
+    #
+    # -@ splits on BOTH \n and \r, so either one in a name would cut the pattern
+    # in two and the tail could match an unrelated entry - a real collateral
+    # deletion, reproduced with a "big/x\ry.txt" entry taking "y.txt" with it.
+    # Such names fall back to argv, where no delimiter exists. (A \n cannot in
+    # fact survive _archive_list's line splitting today, but guarding only \r
+    # would be relying on that accident.)
+    delimiter_safe = not any("\n" in p or "\r" in p for p in patterns)
+    try:
+        if sum(len(p) + 1 for p in patterns) > 200000 and delimiter_safe:
+            r = subprocess.run(["/usr/bin/zip", "-d", args.archive, "-@"],
+                               input="\n".join(patterns) + "\n", capture_output=True, text=True)
+        else:
+            r = subprocess.run(["/usr/bin/zip", "-d", args.archive, "--"] + patterns,
+                               capture_output=True, text=True)
+    except OSError as e:
+        # Only reachable when the argv fallback above is forced by a delimiter in
+        # a name AND the list is enormous; better an honest error than a crash.
+        eprint("could not run zip: %s" % e)
+        return 1
+
+    # Verify against the archive instead of trusting the exit code. zip exits
+    # non-zero with "Nothing to do" when no pattern matched - which used to be
+    # scored as SUCCESS - and treats an unmatched name as a mere warning. Re-
+    # listing is the only check that cannot be fooled by either.
+    after = _archive_list(args.archive, raw=True)
+    if after is None:
+        eprint(r.stderr.strip() or r.stdout.strip())
+        eprint("archive unreadable after delete")
+        return 1
+    before_names = set(n for n, *_ in rows)
+    after_names = set(n for n, *_ in after)
+    target_names = set(n for n, _ in targets)
+    survivors = after_names & target_names
+    # Checking only that the targets are gone proves half the property. The other
+    # half - that nothing ELSE was removed - is what catches a pattern matching
+    # more than it should, which is the whole class of bug this rewrite exists to
+    # prevent. `rows` is already in hand, so the check is free.
+    collateral = (before_names - after_names) - target_names
+    if collateral or survivors:
+        eprint(r.stderr.strip() or r.stdout.strip())
+        if collateral:
+            eprint("delete removed %d entr%s it was not asked to: %s"
+                   % (len(collateral), "y" if len(collateral) == 1 else "ies",
+                      ", ".join(sorted(collateral)[:5])))
+        if survivors:
+            eprint("delete left %d of %d target entr%s in place"
+                   % (len(survivors), len(targets), "y" if len(survivors) == 1 else "ies"))
+        # 5 = the archive WAS modified, just not exactly as asked, so the caller
+        # must refresh its model and treat the document as changed. 1 = nothing
+        # was touched, so the caller's model is still accurate.
+        return 5 if before_names != after_names else 1
     return 0
 
 
