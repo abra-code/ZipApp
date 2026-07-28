@@ -10,6 +10,7 @@ the original (or Save As to a chosen path).
 """
 
 import os
+import re
 import sys
 import shutil
 import subprocess
@@ -566,6 +567,38 @@ def _read_model_rows():
             for i in range(0, len(fields) - (MODEL_COLS - 1), MODEL_COLS)]
 
 
+def _added_under_other_names(r):
+    """How many items ziptool had to store under a name of its own choosing.
+
+    It prints one "stored as: <name>" line per item and a count at the end; the
+    count is what we parse. Renaming is silent otherwise, and it is not
+    cosmetic: a renamed entry does NOT replace an existing one of that name, so
+    re-adding an edited file whose name has to change lands beside the old copy
+    instead of over it.
+
+    Anchored, and it keeps scanning: an entry can be NAMED "9 names changed to
+    fit the archive", and matching that line loosely reported zero renames -
+    exactly the silence this exists to prevent.
+
+    split("\\n"), NOT splitlines(): splitlines also breaks on VT, FF, FS, GS, RS,
+    NEL, U+2028 and U+2029, and repair folds only TAB, CR and LF - so a filename
+    carrying any of those eight splits one stderr line into two and can forge a
+    line of its own.
+
+    And scanned BACKWARDS, because a name can still carry a real newline: the
+    folder being added INTO is never repaired (repairing it would add to a new
+    folder beside the one the user is looking at), so a folder whose stored name
+    contains a newline puts one into the "stored as:" lines. Every line a name
+    can forge is printed before this count, which ziptool emits last, so the
+    LAST match is the true one. Taking the first let a crafted folder name
+    report zero renames - the silence this exists to prevent."""
+    for line in reversed((r.stderr or b"").decode("utf-8", "replace").split("\n")):
+        m = re.fullmatch(r"(\d+) names? changed to fit the archive", line.rstrip("\r"))
+        if m:
+            return int(m.group(1))
+    return 0
+
+
 def _status_summary(verb, note=""):
     n = len(_read_model_rows())
     enc = pb_get(PB_ENC)
@@ -578,6 +611,7 @@ def _status_summary(verb, note=""):
 # --- Mutations ------------------------------------------------------------
 def add_paths(paths, prefix=None):
     recrypted_note = False
+    renamed_note = 0
     if prefix is None:
         prefix = cur_prefix()
 
@@ -601,6 +635,7 @@ def add_paths(paths, prefix=None):
             if r.returncode != 0:
                 alert("Could not add the selected items.", level="caution")
                 return
+            renamed_note = _added_under_other_names(r)
             # scratch is now mixed (existing encrypted + new plaintext); re-encrypt all
             # entries under the session password so none is left in the clear.
             rr = _run_recrypt(scratch, recrypted, "aes256", pw, pw)
@@ -623,19 +658,41 @@ def add_paths(paths, prefix=None):
         if r.returncode != 0:
             alert("Could not add the selected items.", level="caution")
             return
+        renamed_note = _added_under_other_names(r)
 
     mark_dirty()
     regenerate_model()
     populate_level(cur_prefix())
+    note = ""
     if recrypted_note:
         # The whole archive is rewritten as AES-256 regardless of what it was
         # before, so a ZipCrypto archive gets silently upgraded - a security
         # improvement, but a compatibility change worth saying out loud. Setting
         # this inside the branch above meant _status_summary overwrote it before
         # the user could read it.
-        _status_summary("Added to", note=" - re-encrypted (AES-256)")
-    else:
-        _status_summary("Added to")
+        note += " - re-encrypted (AES-256)"
+    if renamed_note:
+        note += " - %d item%s stored under a different name" % (
+            renamed_note, "" if renamed_note == 1 else "s")
+    _status_summary("Added to", note=note)
+    if renamed_note:
+        # ziptool named each one on stderr (kept only when debug logging is on).
+        # The alert is the part that matters: without it the sole evidence is an
+        # entry appearing in the list under a name the user did not choose - and
+        # re-adding an edited file whose name has to change does NOT replace the
+        # old entry, it lands beside it, so silence here is genuinely misleading.
+        log((r.stderr or b"").decode("utf-8", "replace"))
+        # Cause-neutral on purpose: the count covers a folded tab or line break
+        # AND the plainer case of two items wanting the same name, and naming
+        # only the first would be wrong most of the time.
+        alert("%d item%s could not be stored under %s own name - either the "
+              "archive already had an item of that name, or the name contains a "
+              "tab or a line break - so %s stored under a changed one. Check the "
+              "list for the new name%s."
+              % (renamed_note, "" if renamed_note == 1 else "s",
+                 "its" if renamed_note == 1 else "their",
+                 "it was" if renamed_note == 1 else "they were",
+                 "" if renamed_note == 1 else "s"))
 
 
 def delete_selected():
@@ -903,15 +960,27 @@ def do_extract():
     args += ["--result-file=%s" % rf_path]
     r = run_ziptool(*args, stdin=(pw or None), stream_stdout=True)
     rc = r.returncode
-    count, root, skipped = 0, dest, 0
+    count, root, skipped, renamed = 0, dest, 0, 0
     try:
-        with open(rf_path, "r", encoding="utf-8") as f:
-            parts = f.read().strip().split("\t")
-        # Tolerate the older 2-field summary as well as the 3-field one.
+        with open(rf_path, "r", encoding="utf-8", errors="surrogateescape") as f:
+            raw = f.read()
+        # NUL-framed: the path field carries the user's chosen destination, and a
+        # TAB in a folder name split it in two, so `skipped` came from the tail of
+        # the path and parsed as 0 - a PARTIAL extraction shown as complete. A
+        # path cannot contain NUL. Falls back to the older tab form.
+        if "\0" in raw:
+            parts = raw.split("\0")
+            if parts and parts[-1] == "":
+                parts.pop()
+        else:
+            parts = raw.strip().split("\t")
+        # Tolerate the older 2- and 3-field summaries as well as the 4-field one.
         if len(parts) >= 2 and parts[0].isdigit():
             count, root = int(parts[0]), parts[1]
         if len(parts) >= 3 and parts[2].isdigit():
             skipped = int(parts[2])
+        if len(parts) >= 4 and parts[3].isdigit():
+            renamed = int(parts[3])
     except OSError:
         pass
     finally:
@@ -933,6 +1002,8 @@ def do_extract():
             msg += "  (renamed to avoid overwriting)"
         if skipped:
             msg += "  - %d entr%s skipped" % (skipped, "y" if skipped == 1 else "ies")
+        if renamed:
+            msg += "  - %d name%s changed" % (renamed, "" if renamed == 1 else "s")
         set_status(msg)
         # Transient toast acknowledges the quick action and offers Reveal; no
         # notification (that is for background work the user has looked away from).
@@ -941,15 +1012,35 @@ def do_extract():
         if skipped:
             toast += ", %d skipped" % skipped
         present_toast(toast, 6, "Show in Finder", "Zip.reveal")
-        if skipped:
-            # The helper named each rejected entry on stderr; keep it for the log
-            # so "which ones?" is answerable after the fact.
+        if skipped or renamed:
+            # The helper named each rejected and each repaired entry on stderr.
+            # log() only writes when debug logging is switched on, so this is a
+            # diagnostic aid rather than the user's answer to "which ones?" -
+            # for a rename that answer is the extracted folder itself, which is
+            # why the alert below points at it by name.
             log((r.stderr or b"").decode("utf-8", "replace"))
-            alert("%d entr%s could not be extracted and %s skipped. Everything "
-                  "else was extracted to “%s”."
-                  % (skipped, "y" if skipped == 1 else "ies",
-                     "was" if skipped == 1 else "were", os.path.basename(root)),
-                  level="caution")
+        # A rename is not a failure - those files ARE on disk - but they are not
+        # under the name the archive lists, so saying nothing leaves the user
+        # looking for something that is not there. It must be said even when
+        # something was also skipped, so the two are one message rather than a
+        # branch where the rarer news is swallowed by the louder.
+        if skipped or renamed:
+            notes = []
+            if skipped:
+                notes.append("%d entr%s could not be extracted"
+                             % (skipped, "y" if skipped == 1 else "ies"))
+            if renamed:
+                # Cause-neutral: this count covers a name the filesystem cannot
+                # hold, a name two entries both wanted, and an entry whose name
+                # the archive did not record at all.
+                notes.append("%d item%s could not be written under the name the "
+                             "archive lists and %s renamed"
+                             % (renamed, "" if renamed == 1 else "s",
+                                "was" if renamed == 1 else "were"))
+            tail = ("The rest was extracted to “%s”." if skipped
+                    else "They are in “%s”.") % os.path.basename(root)
+            alert("%s. %s" % ("; ".join(notes), tail),
+                  level="caution" if skipped else "note")
     elif rc == 2:
         pb_set(PB_PASSWORD, "")
         set_status("Incorrect password.")

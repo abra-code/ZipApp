@@ -31,10 +31,12 @@ Exit codes: 0 ok | 1 generic error | 2 needs/incorrect password | 4 not a valid 
 
 import argparse
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import unicodedata
 import urllib.parse
 
 # Zip stores entry names as bytes with no reliable encoding declaration, so a
@@ -380,6 +382,64 @@ def cmd_read(args):
 
 # --------------------------------------------------------------------------- extract
 
+# --------------------------------------------------------------------------- name repair
+
+# A zip name is arbitrary bytes; a macOS filename is not. APFS refuses anything
+# that is not well-formed UTF-8 ([Errno 92] Illegal byte sequence), and TAB, CR
+# and LF - storable, but the framing character of every protocol between the
+# helper, this script and the UI - can only ever be displayed folded. So a name
+# is REPAIRED at the two points where it crosses into that world: when the
+# helper writes an entry to disk, and when a file from disk is stored in an
+# archive. Names already in an archive are never rewritten - listing, matching
+# and deleting all still work on the exact bytes the archive holds.
+#
+# These two functions mirror archive.c's repair_component() byte for byte.
+# Python decodes entry names with surrogateescape, so each byte that is not
+# valid UTF-8 arrives as one lone surrogate - the same unit the C side replaces.
+
+def _is_noncharacter(ch):
+    """Well-formed UTF-8 that the filesystem still refuses (verified: Errno 92).
+    Permanent by Unicode's stability policy. Note APFS also refuses UNASSIGNED
+    code points, a set that changes with every Unicode revision - so repair
+    makes a name storable far more often, but cannot promise it."""
+    cp = ord(ch)
+    return 0xFDD0 <= cp <= 0xFDEF or (cp & 0xFFFE) == 0xFFFE
+
+
+def repair_component(c):
+    """One path component with TAB/CR/LF folded to a space and every byte that
+    is not well-formed UTF-8 folded to '_'. One surrogate is one such byte,
+    which is what makes this match archive.c's repair_component exactly."""
+    out = []
+    for ch in c:
+        if ch in "\t\r\n":
+            out.append(" ")
+        elif "\ud800" <= ch <= "\udfff":
+            out.append("_")
+        elif _is_noncharacter(ch):
+            out.append("_" * len(ch.encode("utf-8")))
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def needs_repair(s):
+    return any(ch in "\t\r\n" or "\ud800" <= ch <= "\udfff" or _is_noncharacter(ch)
+               for ch in s)
+
+
+def unstorable(s):
+    """True when the filesystem will REFUSE this name outright (EILSEQ), rather
+    than it merely being awkward for us. TAB, CR and LF are perfectly storable
+    on APFS - we fold them for our own protocols' sake - so they do not count
+    here. Bytes that are not well-formed UTF-8, and noncharacters, do."""
+    return any("\ud800" <= ch <= "\udfff" or _is_noncharacter(ch) for ch in s)
+
+
+def repair_path(p):
+    return "/".join(repair_component(c) for c in p.split("/"))
+
+
 def sanitize_rel(rel):
     """Return a safe relative path or None if it tries to escape."""
     rel = rel.replace("\\", "/")
@@ -474,19 +534,20 @@ def cmd_extract(args):
     # --entry). Make that item unique so an existing same-name item is never
     # overwritten or merged into; the new name (if any) replaces the top component
     # of every output path.
+    #
+    # repair_component first: the helper writes the entry under its repaired
+    # name, so the item we go looking for - and the name the user ends up with -
+    # has to be the repaired one too. Without it a folder whose archive name
+    # carries a tab or a legacy encoding would be "not found" and the whole
+    # extraction thrown away.
     if args.all:
         top, top_is_dir = archive_base, True
     elif args.prefix is not None:
         top, top_is_dir = os.path.basename(args.prefix.rstrip("/")), True
     else:
         top, top_is_dir = os.path.basename((args.entry or "").rstrip("/")), False
+    top = repair_component(top)
     unique_top = _unique_in(dest, top, top_is_dir)
-
-    def retop(rel):
-        if unique_top == top:
-            return rel
-        head, _, tail = rel.partition("/")
-        return unique_top + ("/" + tail if tail else "")
 
     # Count the files the helper will extract so progress can report a known
     # total ("file N of M"). The filters mirror the helper's: junk skipped,
@@ -519,6 +580,7 @@ def cmd_extract(args):
 
     count = 0
     skipped = 0
+    renamed = 0
     try:
         # stderr goes to a file, not a pipe: the helper can emit a diagnostic
         # line per rejected entry with no matching stdout, and a filled stderr
@@ -544,9 +606,20 @@ def cmd_extract(args):
                 except (ValueError, IndexError):
                     pass
                 continue
+            # Likewise "renamed N": entries the filesystem could not store under
+            # their archive name. Those DID extract - they just landed under a
+            # repaired name, so the user has to be told which files moved.
+            if line.startswith(b"renamed "):
+                try:
+                    renamed = int(line.split()[1])
+                except (ValueError, IndexError):
+                    pass
+                continue
             count += 1
-            if count % PROGRESS_EVERY == 0 or count == total:
-                print("file %d of %d" % (count, total))
+            if count % PROGRESS_EVERY == 0 or count >= total:
+                # An entry whose name libarchive discarded is extracted but is
+                # not in the listing `total` came from, so count can overtake it.
+                print("file %d of %d" % (count, max(total, count)))
                 sys.stdout.flush()
         rc = proc.wait()
         # rc 5 is a PARTIAL extraction: some entries were rejected, but the rest
@@ -560,7 +633,9 @@ def cmd_extract(args):
                 sys.stderr.buffer.write(stderr)
             errf.close()
             return 2 if rc == 2 else (4 if rc == 4 else 1)
-        if rc == 5:
+        # Also on a rename: the helper named every repaired entry on stderr, and
+        # that list is the only record of which file landed under which name.
+        if rc == 5 or renamed:
             errf.seek(0)
             stderr = errf.read()
             if stderr:
@@ -571,10 +646,11 @@ def cmd_extract(args):
         if args.all:
             src_top = tmproot
         elif args.prefix is not None:
-            src_top = os.path.join(tmproot, *args.prefix.rstrip("/").split("/"))
+            src_top = os.path.join(tmproot,
+                                   *repair_path(args.prefix.rstrip("/")).split("/"))
         else:
             safe = sanitize_rel(args.entry)
-            src_top = os.path.join(tmproot, safe) if safe else None
+            src_top = os.path.join(tmproot, repair_path(safe)) if safe else None
         # Placement must NOT be gated on `count`, which counts files only: a
         # selection that is entirely directories (an empty folder) extracted
         # correctly into the staging dir and was then deleted by the finally
@@ -602,23 +678,33 @@ def cmd_extract(args):
     eprint("extracted %d item(s) to %s" % (count, root))
     if skipped:
         eprint("%d entr%s could not be extracted" % (skipped, "y" if skipped == 1 else "ies"))
+    if renamed:
+        eprint("%d name%s could not be stored as-is and %s changed"
+               % (renamed, "" if renamed == 1 else "s",
+                  "was" if renamed == 1 else "were"))
     if count == 0 and not placed:
         eprint("nothing matched")
         return 1
-    # Machine-readable summary: "<count>\t<top-level path created>\t<skipped>".
-    # With --result-file it is written there so stdout stays reserved for the
-    # live progress lines OMC parses; otherwise it is printed to stdout (CLI
-    # use). Readers must tolerate the older 2-field form.
-    summary = "%d\t%s\t%d" % (count, root, skipped)
+    # Machine-readable summary: count, the top-level path created, skipped,
+    # renamed. With --result-file it is written there so stdout stays reserved
+    # for the live progress lines OMC parses; otherwise it goes to stdout.
+    #
+    # The result file is NUL-framed, for the same reason `list --nul` is: the
+    # path field holds the user's chosen destination, and a TAB in a folder name
+    # split it across two fields, so `skipped` was read from the tail of the path
+    # and parsed as 0 - a PARTIAL extraction reported as complete, and the
+    # "Show in Finder" path truncated. A path cannot contain NUL. The stdout form
+    # stays tab-separated for CLI use, with the same lossiness as `list`.
+    fields = [str(count), root, str(skipped), str(renamed)]
     if getattr(args, "result_file", None):
         try:
             with open(args.result_file, "w", encoding="utf-8",
                       errors="surrogateescape") as rf:
-                rf.write(summary + "\n")
+                rf.write("\0".join(fields) + "\0")
         except OSError as e:
             eprint("result-file write failed: %s" % e)
     else:
-        print(summary)
+        print("\t".join(fields))
     return 5 if skipped else 0
 
 
@@ -677,8 +763,148 @@ def _additions_from_sources(sources, prefix):
     return pairs
 
 
+def _fold(s):
+    """Key under which the STAGING FILESYSTEM considers two names the same.
+
+    Staging happens on APFS, which is case- and normalization-insensitive, so a
+    byte-exact comparison misses collisions the filesystem will not - and the
+    loser of such a collision is written THROUGH a staged hardlink, straight
+    into the user's original file (see cmd_add)."""
+    return unicodedata.normalize("NFC", s).casefold()
+
+
+def _unique_arc(prefix, cand, batch, existing, is_dir):
+    """Finder-style free variant of <cand> within the archive: 'name', then
+    'name 2', 'name 3'. Mirrors _unique_in and archive.c's unique_name. Avoids
+    both what this operation has already assigned and what the archive already
+    holds - an invented name must never land on either."""
+    def free(x):
+        k = _fold(prefix + x)
+        return k not in batch and k not in existing
+    if free(cand):
+        return cand
+    head, _, base = cand.rpartition("/")
+    stem, ext = (base, "") if is_dir else os.path.splitext(base)
+    n = 2
+    while True:
+        nxt = "%s%s %d%s" % (head + "/" if head else "", stem, n, ext)
+        if free(nxt):
+            return nxt
+        n += 1
+
+
+def _resolve_arcnames(pairs, prefix, archive):
+    """Decide the archive name every source lands under, so that no two sources
+    can ever be staged at the same path.
+
+    Two jobs, one rule:
+
+    - Fold TAB/CR/LF and any non-UTF-8 byte out of the name, so a NEW archive
+      never carries a name we would have to repair on the way back out (or fold
+      for display, leaving what the user sees different from what the archive
+      holds).
+    - Give a Finder-style counter to any name this operation has already
+      assigned to something else. That covers the fold, which is lossy
+      ("a<TAB>b.txt" and "a b.txt" are two files with one folded name), and the
+      plainer case of two sources sharing a basename ("X/report.txt" plus
+      "Y/report.txt"). Both used to collide in the staging dir, where the file
+      staged first is a HARDLINK to the user's original - so the loser was
+      written straight through it and the source file on disk was destroyed.
+
+    A name that merely matches an entry the archive ALREADY holds is left alone:
+    that is the in-place update the user asked for. Only an INVENTED name has to
+    dodge the existing entries, which is why the archive is listed lazily - a
+    clean add never reads it.
+
+    <prefix> is the folder being added into. It is an EXISTING archive name and
+    is never touched - repairing it would add to a new folder beside the one the
+    user is looking at."""
+    existing = None
+
+    def load_existing():
+        nonlocal existing
+        if existing is None:
+            listed = _archive_list(archive)
+            if listed is None:
+                return None
+            existing = {_fold(row[0].rstrip("/")) for row in listed}
+        return existing
+
+    dirs, batch = {}, set()
+    out, changed = [], 0
+    for full, arc in pairs:
+        is_dir = os.path.isdir(full) and not os.path.islink(full)
+        parts = [c for c in arc[len(prefix):].split("/") if c]
+        acc = ""
+        for i, comp in enumerate(parts):
+            last = (i == len(parts) - 1)
+            keep = (not last) or is_dir   # a directory: remember where it landed
+            key = prefix + "/".join(parts[:i + 1])
+            if keep and key in dirs:
+                acc = dirs[key][len(prefix):]
+                continue
+            rep = repair_component(comp)
+            cand = (acc + "/" + rep) if acc else rep
+            if rep != comp or _fold(prefix + cand) in batch:
+                ex = load_existing()
+                if ex is None:
+                    # We are about to invent a name and zip -r REPLACES a
+                    # same-named entry. Without the archive's own list there is
+                    # no way to know what the invented name would land on.
+                    eprint("cannot read the archive's entry list; "
+                           "refusing to rename into it")
+                    return None, 0
+                cand = _unique_arc(prefix, cand, batch, ex, keep)
+            batch.add(_fold(prefix + cand))
+            if keep:
+                dirs[key] = prefix + cand
+            acc = cand
+        new = prefix + acc
+        if new != arc:
+            changed += 1
+            eprint("stored as: %s" % new)
+        out.append((full, new))
+    return out, changed
+
+
 def cmd_add(args):
-    sources = [p for p in sys.stdin.read().splitlines() if p.strip()]
+    # Staging mirrors the archive's folder structure on disk, so a target folder
+    # whose stored name the filesystem cannot hold has nowhere to be staged. The
+    # mkdir would raise EILSEQ and take the whole command down with a traceback;
+    # say it in a sentence instead. (Such a folder is reachable in the UI now
+    # that legacy archives list and extract.)
+    if unstorable(args.prefix or ""):
+        eprint("cannot add into this folder: its name in the archive contains "
+               "characters this Mac cannot use in a path")
+        return 1
+    # Order-preserving dedup: the same path listed twice is one addition, not
+    # two entries holding identical bytes.
+    #
+    # The key collapses only what is ALWAYS redundant - repeated slashes, "/./"
+    # segments, a trailing slash. It deliberately does NOT collapse "..", which
+    # os.path.normpath does: that is a lexical rewrite and it is wrong across a
+    # symlink, so "s/a/link/../c.txt" and "s/a/c.txt" - two different files -
+    # keyed the same and one was silently dropped at rc 0. Leaving ".." alone
+    # can only ever fail the other way, letting a duplicate through, and
+    # _resolve_arcnames gives that a counter rather than losing it.
+    seen = set()
+    sources = []
+    for p in sys.stdin.read().splitlines():
+        if not p.strip():
+            continue
+        key = re.sub(r"/+", "/", p)
+        while "/./" in key:
+            key = key.replace("/./", "/")
+        if key.startswith("./"):
+            key = key[2:]
+        key = key.rstrip("/") or "/"
+        if not key.startswith("/"):
+            # Absolute, but by prefixing rather than os.path.abspath, which
+            # calls normpath and would bring ".." collapsing back with it.
+            key = os.path.join(os.getcwd(), key)
+        if key not in seen:
+            seen.add(key)
+            sources.append(p)
     if not sources:
         eprint("no sources on stdin")
         return 1
@@ -686,6 +912,9 @@ def cmd_add(args):
     if not to_add:
         eprint("nothing to add")
         return 1
+    to_add, repaired = _resolve_arcnames(to_add, args.prefix or "", args.archive)
+    if to_add is None:
+        return 4
 
     # Stage the additions under their archive names, then let Info-ZIP add them in
     # place. zip appends/updates without recompressing existing entries (libarchive
@@ -693,12 +922,23 @@ def cmd_add(args):
     # are recreated as symlinks (os.link would follow to the target) and stored as
     # such by zip -y.
     staging = tempfile.mkdtemp(prefix="zipadd-")
+    staged = 0
     try:
         for full, arc in to_add:
             dst = os.path.join(staging, arc)
             os.makedirs(os.path.dirname(dst) or staging, exist_ok=True)
+            # NOTHING may be written onto an already staged path. A staged file
+            # is a HARDLINK to the user's original, so copy2 onto it does not
+            # replace the staged copy - it writes THROUGH the link and destroys
+            # the source file on disk, outside the archive entirely. The naming
+            # pass above should make this unreachable; it stays because that
+            # failure is silent and irreversible.
             if os.path.islink(full):
+                if os.path.lexists(dst):
+                    eprint("skip: %s is already staged" % arc)
+                    continue
                 os.symlink(os.readlink(full), dst)
+                staged += 1
                 continue
             if os.path.isdir(full):
                 # exist_ok tolerates an existing DIRECTORY only; a file already
@@ -708,14 +948,16 @@ def cmd_add(args):
                     eprint("skip: %s collides with a file of the same name" % arc)
                     continue
                 os.makedirs(dst, exist_ok=True)   # empty dir: shape only, no data
+                staged += 1
                 continue
-            if os.path.isdir(dst) and not os.path.islink(dst):
-                eprint("skip: %s collides with a folder of the same name" % arc)
+            if os.path.lexists(dst):
+                eprint("skip: %s is already staged" % arc)
                 continue
             try:
                 os.link(full, dst)
             except OSError:
                 shutil.copy2(full, dst)
+            staged += 1
         archive_abs = os.path.abspath(args.archive)
         r = subprocess.run(["/usr/bin/zip", "-r", "-q", "-X", "-y", archive_abs, "."],
                            cwd=staging, capture_output=True)
@@ -724,7 +966,9 @@ def cmd_add(args):
             return 1
     finally:
         shutil.rmtree(staging, ignore_errors=True)
-    eprint("added %d item(s)" % len(to_add))
+    eprint("added %d item(s)" % staged)
+    if repaired:
+        eprint("%d name%s changed to fit the archive" % (repaired, "" if repaired == 1 else "s"))
     return 0
 
 
