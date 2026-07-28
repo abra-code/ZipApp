@@ -9,7 +9,7 @@ from lib_zip import *
 name = get_table_value(2)
 size = get_table_value(3)
 modified = get_table_value(4)
-fullpath = get_table_value(5)
+fullpath = get_table_path(5)   # hidden column is percent-encoded
 isdir = get_table_value(6)
 enc = get_table_value(7)
 
@@ -19,10 +19,10 @@ if not fullpath or fullpath == "__UP__":
     clear_inspector()
     enable_view(ID_EXTRACT_BTN, False)
     enable_view(ID_DELETE_BTN, False)
-    set_status(arc_location(pb_get(PB_PREFIX)))   # nothing selected: show current folder
+    set_status(arc_location(cur_prefix()))   # nothing selected: show current folder
     sys.exit(0)
 
-pb_set(PB_SEL_PATH, fullpath)
+pb_set(PB_SEL_PATH, path_encode(fullpath))
 pb_set(PB_SEL_ISDIR, isdir)
 
 set_value(ID_DET_NAME, name)

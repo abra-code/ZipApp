@@ -35,6 +35,22 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import urllib.parse
+
+# Zip stores entry names as bytes with no reliable encoding declaration, so a
+# legacy CP437 / Shift-JIS archive carries names that are not valid UTF-8.
+# Decoding those with errors="replace" turned them into U+FFFD and made the
+# entries permanently unaddressable - they could be listed but never extracted or
+# deleted, because the name could no longer be handed back to the helper. Every
+# name in this tool is therefore carried as str decoded with "surrogateescape",
+# which round-trips arbitrary bytes exactly, and stdout/stderr are reconfigured
+# so those strings can be written back out unchanged.
+# stdin too: a source path handed to `add` may itself hold non-UTF-8 bytes on a
+# non-APFS volume, and a strict decode there crashed the add. Guarded against a
+# closed standard stream, where reconfigure() would raise on None.
+for _stream in (sys.stdin, sys.stdout, sys.stderr):
+    if _stream is not None:
+        _stream.reconfigure(errors="surrogateescape")
 
 # Internal model TSV columns (one row per real or synthesized entry):
 #   fullpath  isdir(0/1)  size  csize  mtime("YYYY-MM-DD HH:MM" or "")  enc(0/1)  enctype
@@ -55,6 +71,15 @@ ARCHIVE_BIN = os.path.join(
 
 def eprint(*a):
     print(*a, file=sys.stderr)
+
+
+def _msg(b):
+    """Decode a subprocess's output for display. Never text=True on anything that
+    echoes an entry name: Info-ZIP prints the names it deletes, and a legacy
+    CP437 / Shift-JIS name is not valid UTF-8, so a strict decode raises
+    UnicodeDecodeError - which turned a delete that had actually SUCCEEDED into a
+    reported failure."""
+    return (b or b"").decode("utf-8", "surrogateescape").strip()
 
 
 # --------------------------------------------------------------------------- native helper
@@ -86,24 +111,28 @@ def _archive_list(archive, raw=False):
     entry stored without a trailing slash is reported with one, and a "\\" in a
     name with no "/" is reported as "/" (a DOS-path heuristic). Callers must
     verify the effect of a mutation rather than assume the name matched."""
-    r = subprocess.run([ARCHIVE_BIN, "list", archive], input=b"", capture_output=True)
+    # --nul: six NUL-terminated fields per record. The TSV form cannot represent
+    # a name containing a tab (field split, name truncated) or a newline (record
+    # split into two phantom rows), and both are legal in a zip. A pathname
+    # arrives from libarchive as a C string, so NUL is the one byte it cannot
+    # contain - which makes this framing lossless with no escaping.
+    r = subprocess.run([ARCHIVE_BIN, "list", archive, "--nul"], input=b"", capture_output=True)
     if r.returncode != 0:
         if r.stderr:
             sys.stderr.buffer.write(r.stderr)
         return None
+    fields = (r.stdout or b"").split(b"\0")
+    if fields and fields[-1] == b"":
+        fields.pop()                      # trailing terminator, not a field
     rows = []
-    for line in (r.stdout or b"").decode("utf-8", "replace").split("\n"):
-        if not line:
-            continue
-        parts = line.split("\t")
-        if len(parts) < 6:
-            parts += [""] * (6 - len(parts))
+    for i in range(0, len(fields) - 5, 6):
+        parts = [f.decode("utf-8", "surrogateescape") for f in fields[i:i + 6]]
         # Normalize a leading "./" here, at the single entry point of archive
         # names into the model, so matching/counting agrees with the helper's
         # norm()-based comparisons for bsdtar-style "./name" archives.
         if not raw and parts[0].startswith("./"):
             parts[0] = parts[0][2:]
-        rows.append(parts[:6])
+        rows.append(parts)
     return rows
 
 
@@ -186,24 +215,27 @@ def cmd_list(args):
     if rows is None:
         return 4
     out = sys.stdout
+    # Same framing as the helper's --nul output, and for the same reason: the
+    # cached model is written to a file and read back, so a tab or newline in a
+    # name would corrupt it exactly as it corrupted the helper's TSV. Seven
+    # NUL-terminated fields per record.
     for r in rows:
-        out.write("\t".join(r) + "\n")
+        out.write("\0".join(r) + "\0")
     return 0
 
 
 # --------------------------------------------------------------------------- level / find
 
 def read_model(tsv_path):
+    """Parse the cached model: MODEL_COLS NUL-terminated fields per record."""
+    with open(tsv_path, "rb") as f:
+        fields = f.read().split(b"\0")
+    if fields and fields[-1] == b"":
+        fields.pop()
     rows = []
-    with open(tsv_path, "r", encoding="utf-8", errors="replace") as f:
-        for line in f:
-            line = line.rstrip("\n")
-            if not line:
-                continue
-            parts = line.split("\t")
-            if len(parts) < MODEL_COLS:
-                parts += [""] * (MODEL_COLS - len(parts))
-            rows.append(parts[:MODEL_COLS])
+    for i in range(0, len(fields) - (MODEL_COLS - 1), MODEL_COLS):
+        rows.append([x.decode("utf-8", "surrogateescape")
+                     for x in fields[i:i + MODEL_COLS]])
     return rows
 
 
@@ -214,9 +246,40 @@ def display_name(fullpath, isdir):
     return fullpath.rstrip("/").rsplit("/", 1)[-1]
 
 
+def display_safe(s):
+    """Render a value for a VISIBLE table column.
+
+    Two constraints, both from OMC's table feed. It is tab-separated and
+    newline-terminated, so those characters cannot appear in a field; and its
+    reader decodes each row as strict UTF-8 and silently DROPS any row it cannot
+    decode, so a legacy CP437 / Shift-JIS name would make the whole entry vanish
+    from the list. Undecodable bytes therefore become U+FFFD here - display only.
+    The exact bytes still travel in the hidden column, which is what the app
+    actually addresses entries by."""
+    s = s.encode("utf-8", "surrogateescape").decode("utf-8", "replace")
+    return s.replace("\t", " ").replace("\r", " ").replace("\n", " ")
+
+
+def path_encode(s):
+    """Encode a path for the hidden ADDRESSING column.
+
+    Must be injective and pure ASCII. Injective because sanitizing for display
+    is not: "a<TAB>b.txt" and "a<SPACE>b.txt" both flatten to the same string, so
+    selecting one row and deleting it destroyed the OTHER entry and reported
+    success. ASCII because both channels this value crosses are UTF-8 only - the
+    table feed drops an undecodable row, and the pasteboard tool clears the key
+    rather than storing invalid UTF-8, which silently emptied the selection.
+
+    Percent-encoding satisfies both and round-trips exactly. "/" stays literal so
+    ordinary paths remain readable in a log."""
+    return urllib.parse.quote(s.encode("utf-8", "surrogateescape"), safe="/")
+
+
 def feed_row(symbol, name, size_h, mtime, fullpath, isdir, enc):
-    """Seven tab-separated fields: visible (Icon, Name, Size) + Modified + hidden (fullpath, isdir, enc)."""
-    return "\t".join([symbol, name, size_h, mtime, fullpath, isdir, enc])
+    """Seven tab-separated fields: visible (Icon, Name, Size) + Modified + hidden
+    (percent-encoded fullpath, isdir, enc)."""
+    return "\t".join([display_safe(symbol), display_safe(name), display_safe(size_h),
+                      display_safe(mtime), path_encode(fullpath), isdir, enc])
 
 
 def icon_for(isdir, enc):
@@ -535,7 +598,8 @@ def cmd_extract(args):
     summary = "%d\t%s\t%d" % (count, root, skipped)
     if getattr(args, "result_file", None):
         try:
-            with open(args.result_file, "w", encoding="utf-8") as rf:
+            with open(args.result_file, "w", encoding="utf-8",
+                      errors="surrogateescape") as rf:
                 rf.write(summary + "\n")
         except OSError as e:
             eprint("result-file write failed: %s" % e)
@@ -621,9 +685,9 @@ def cmd_add(args):
                 shutil.copy2(full, dst)
         archive_abs = os.path.abspath(args.archive)
         r = subprocess.run(["/usr/bin/zip", "-r", "-q", "-X", "-y", archive_abs, "."],
-                           cwd=staging, capture_output=True, text=True)
+                           cwd=staging, capture_output=True)
         if r.returncode != 0:
-            eprint(r.stderr.strip() or r.stdout.strip())
+            eprint(_msg(r.stderr) or _msg(r.stdout))
             return 1
     finally:
         shutil.rmtree(staging, ignore_errors=True)
@@ -719,17 +783,18 @@ def cmd_delete(args):
     # -@ splits on BOTH \n and \r, so either one in a name would cut the pattern
     # in two and the tail could match an unrelated entry - a real collateral
     # deletion, reproduced with a "big/x\ry.txt" entry taking "y.txt" with it.
-    # Such names fall back to argv, where no delimiter exists. (A \n cannot in
-    # fact survive _archive_list's line splitting today, but guarding only \r
-    # would be relying on that accident.)
+    # Such names fall back to argv, where no delimiter exists. Both halves of this
+    # guard are load-bearing: since the listing moved to NUL framing a newline in
+    # a name survives all the way to here, where it previously could not.
     delimiter_safe = not any("\n" in p or "\r" in p for p in patterns)
     try:
         if sum(len(p) + 1 for p in patterns) > 200000 and delimiter_safe:
             r = subprocess.run(["/usr/bin/zip", "-d", args.archive, "-@"],
-                               input="\n".join(patterns) + "\n", capture_output=True, text=True)
+                               input=("\n".join(patterns) + "\n").encode("utf-8", "surrogateescape"),
+                               capture_output=True)
         else:
             r = subprocess.run(["/usr/bin/zip", "-d", args.archive, "--"] + patterns,
-                               capture_output=True, text=True)
+                               capture_output=True)
     except OSError as e:
         # Only reachable when the argv fallback above is forced by a delimiter in
         # a name AND the list is enormous; better an honest error than a crash.
@@ -742,7 +807,7 @@ def cmd_delete(args):
     # listing is the only check that cannot be fooled by either.
     after = _archive_list(args.archive, raw=True)
     if after is None:
-        eprint(r.stderr.strip() or r.stdout.strip())
+        eprint(_msg(r.stderr) or _msg(r.stdout))
         eprint("archive unreadable after delete")
         return 1
     before_names = set(n for n, *_ in rows)
@@ -755,7 +820,7 @@ def cmd_delete(args):
     # prevent. `rows` is already in hand, so the check is free.
     collateral = (before_names - after_names) - target_names
     if collateral or survivors:
-        eprint(r.stderr.strip() or r.stdout.strip())
+        eprint(_msg(r.stderr) or _msg(r.stdout))
         if collateral:
             eprint("delete removed %d entr%s it was not asked to: %s"
                    % (len(collateral), "y" if len(collateral) == 1 else "ies",

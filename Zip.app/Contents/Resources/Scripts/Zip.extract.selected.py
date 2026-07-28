@@ -9,7 +9,7 @@ from lib_zip import *
 dest = os.environ.get("OMC_DLG_CHOOSE_FOLDER_PATH", "")
 if not dest:
     sys.exit(0)
-if not pb_get(PB_SEL_PATH):
+if not sel_path():
     alert("Select a file or folder in the list first.", level="note")
     sys.exit(0)
 pb_set(PB_EX_DEST, dest)

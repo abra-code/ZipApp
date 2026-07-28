@@ -393,14 +393,31 @@ static int cmd_extract(const char *path, const char *destdir, int memberc, char 
     return rc;
 }
 
-/* ---- list: one TSV line per entry (no passphrase needed) ------------------ */
+/* ---- list: one record per entry (no passphrase needed) -------------------- */
 
-/* Emits: pathname<TAB>isdir<TAB>size<TAB>mtime<TAB>enc<TAB>ad
+/* Emits six fields per entry: pathname, isdir, size, mtime, enc, ad.
  * mtime is "YYYY-MM-DD HH:MM" (local) or empty; enc is 1 if the entry is
  * encrypted; ad is 1 for a "._*" file confirmed (or, when encrypted,
  * presumed) to be an AppleDouble sidecar. The zip central directory
- * (names/sizes/flags) is not encrypted, so this works without a password. */
-static int cmd_list(const char *path)
+ * (names/sizes/flags) is not encrypted, so this works without a password.
+ *
+ * Two output shapes:
+ *   default  TAB between fields, NEWLINE between records. Human/CLI readable,
+ *            but LOSSY: a zip name may legally contain a tab or a newline, and
+ *            either one silently corrupts the record.
+ *   --nul    every field NUL-terminated, six per record. A pathname comes from
+ *            libarchive as a C string and therefore cannot contain NUL, so this
+ *            is unambiguous for every name a zip can hold. Zip.app always uses
+ *            it - the delimiters are the only bytes a name cannot contain, so
+ *            nothing needs escaping and nothing can be truncated or split. */
+static void put_field(const char *s)
+{
+    if (s != NULL)
+        fwrite(s, 1, strlen(s), stdout);
+    fputc('\0', stdout);
+}
+
+static int cmd_list(const char *path, int nul)
 {
     struct archive *a = archive_read_new();
     if (a == NULL) return 1;
@@ -443,7 +460,17 @@ static int cmd_list(const char *path)
                 ad = (n == (la_ssize_t)sizeof m && memcmp(m, AD_MAGIC, sizeof m) == 0) ? 1 : 0;
             }
         }
-        printf("%s\t%d\t%lld\t%s\t%d\t%d\n", name, isdir, size, tbuf, enc, ad);
+        if (nul) {
+            char nbuf[32];
+            put_field(name);
+            snprintf(nbuf, sizeof nbuf, "%d", isdir);   put_field(nbuf);
+            snprintf(nbuf, sizeof nbuf, "%lld", size);  put_field(nbuf);
+            put_field(tbuf);
+            snprintf(nbuf, sizeof nbuf, "%d", enc);     put_field(nbuf);
+            snprintf(nbuf, sizeof nbuf, "%d", ad);      put_field(nbuf);
+        } else {
+            printf("%s\t%d\t%lld\t%s\t%d\t%d\n", name, isdir, size, tbuf, enc, ad);
+        }
     }
     if (r < ARCHIVE_OK && r != ARCHIVE_EOF) {
         fprintf(stderr, "archive: list error: %s\n", archive_error_string(a));
@@ -453,6 +480,14 @@ static int cmd_list(const char *path)
     }
     archive_read_close(a);
     archive_read_free(a);
+    /* A short write would hand the caller a TRUNCATED listing with a success
+     * code, and cmd_delete diffs before/after listings as sets - a truncated
+     * "after" reads as entries removed that were never targeted. Same class as
+     * the fwrite check in cmd_read. */
+    if (fflush(stdout) != 0 || ferror(stdout)) {
+        fprintf(stderr, "archive: list: write failed\n");
+        return 1;
+    }
     return 0;
 }
 
@@ -620,7 +655,10 @@ static int usage(void)
         "                                                       # extract all, listed members, or entries under P;\n"
         "                                                       # --skip-junk drops __MACOSX/._*/.DS_Store;\n"
         "                                                       # --progress prints one line per extracted file\n"
-        "  archive list    <archive>                            # TSV path<TAB>isdir<TAB>size<TAB>mtime<TAB>enc<TAB>ad (no password)\n"
+        "  archive list    <archive> [--nul]                    # path,isdir,size,mtime,enc,ad per entry (no password)\n"
+        "                                                       # default: TAB between fields, NEWLINE between records (lossy -\n"
+        "                                                       # a zip name may contain either); --nul: every field NUL-terminated,\n"
+        "                                                       # six per record, unambiguous for any name a zip can hold\n"
         "  archive create  <dest.zip> [--manifest <file>] [--encrypt aes256|zipcrypt]\n"
         "                                                       # build zip from 'arcname<TAB>srcpath' lines (empty if no manifest)\n"
         "  archive recrypt <src> <dest.zip> --mode aes256|zipcrypt|none [--old-pwd-stdin] [--new-pwd-stdin]\n"
@@ -639,7 +677,10 @@ int main(int argc, char **argv)
      * close stdin, which would otherwise block). */
     if (strcmp(cmd, "list") == 0) {
         if (argc < 3) return usage();
-        return cmd_list(argv[2]);
+        int nul = 0;
+        for (int i = 3; i < argc; i++)
+            if (strcmp(argv[i], "--nul") == 0) nul = 1;
+        return cmd_list(argv[2], nul);
     }
 
     /* Slurp stdin once - the only channel secrets travel on. */

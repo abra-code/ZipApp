@@ -26,7 +26,7 @@ dismiss_modal()
 pb_set(PB_PASSWORD, pw)
 refresh_lock_menu()
 # Re-render the current selection now that we can decrypt it.
-sel = pb_get(PB_SEL_PATH)
+sel = sel_path()
 if sel and pb_get(PB_SEL_ISDIR) != "1":
     describe_and_preview(sel, "0", "1")
 set_status("Archive unlocked.")

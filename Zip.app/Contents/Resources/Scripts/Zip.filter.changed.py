@@ -15,4 +15,4 @@ q = os.environ.get("OMC_ACTIONUI_TRIGGER_CONTEXT", "")
 if q:
     populate_filter(q)
 else:
-    populate_level(pb_get(PB_PREFIX))
+    populate_level(cur_prefix())

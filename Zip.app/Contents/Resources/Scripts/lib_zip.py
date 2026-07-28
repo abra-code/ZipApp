@@ -14,6 +14,7 @@ import sys
 import shutil
 import subprocess
 import tempfile
+import urllib.parse
 
 # --- OMC environment ------------------------------------------------------
 SUPPORT_PATH = os.environ.get("OMC_OMC_SUPPORT_PATH", "")
@@ -80,7 +81,7 @@ _LOG = os.path.join(TMP, "zip_debug.log")
 def log(msg):
     if DEBUG:
         try:
-            with open(_LOG, "a") as f:
+            with open(_LOG, "a", errors="surrogateescape") as f:
                 f.write(str(msg) + "\n")
         except OSError:
             pass
@@ -88,8 +89,16 @@ def log(msg):
 
 # --- Pasteboard -----------------------------------------------------------
 def pb_get(key):
-    r = subprocess.run([PASTEBOARD_TOOL, key, "get"], capture_output=True, text=True)
-    return r.stdout.strip()
+    # Bytes in, decoded with surrogateescape: the selected entry path travels
+    # through here, and a legacy CP437 / Shift-JIS name is not valid UTF-8. A
+    # strict decode would raise, and errors="replace" would silently corrupt the
+    # path so the entry could never be extracted or deleted.
+    # rstrip("\n") only, never .strip(): a leading or trailing SPACE is a legal
+    # zip name and common in Windows-authored archives, and stripping it made
+    # " name.txt" collide with a sibling "name.txt" - so an action aimed at one
+    # landed on the other. (The tool appends no trailing newline anyway.)
+    r = subprocess.run([PASTEBOARD_TOOL, key, "get"], capture_output=True)
+    return (r.stdout or b"").decode("utf-8", "surrogateescape").rstrip("\n")
 
 
 def pb_set(key, value):
@@ -97,7 +106,44 @@ def pb_set(key, value):
     # password in PB_PASSWORD) never appear in the process list. The pasteboard
     # tool reads stdin when given no value argument; empty stdin clears the entry.
     subprocess.run([PASTEBOARD_TOOL, key, "set"],
-                   input=(value or "").encode("utf-8"), capture_output=True)
+                   input=(value or "").encode("utf-8", "surrogateescape"),
+                   capture_output=True)
+
+
+def path_encode(s):
+    """Mirror of ziptool.path_encode - see path_decode for why paths cross these
+    channels percent-encoded."""
+    return urllib.parse.quote(s.encode("utf-8", "surrogateescape"), safe="/")
+
+
+def path_decode(s):
+    """Decode a path that came back from the table feed or the pasteboard.
+
+    Both channels carry the percent-encoded form produced by ziptool's
+    path_encode: they are UTF-8 only, and the encoding is what keeps two entries
+    whose names differ only in a tab or a space from collapsing onto each other.
+    Inverse of path_encode; leaves ordinary paths and the "__UP__" sentinel
+    unchanged."""
+    if not s:
+        return s
+    return urllib.parse.unquote_to_bytes(s).decode("utf-8", "surrogateescape")
+
+
+def get_table_path(column=5):
+    """The hidden fullpath column, decoded back to the exact stored bytes."""
+    return path_decode(get_table_value(column))
+
+
+def sel_path():
+    """The selected entry's real path. PB_SEL_PATH holds the ENCODED form because
+    the pasteboard tool cannot store invalid UTF-8 - it clears the key instead,
+    which silently emptied the selection for legacy-named entries."""
+    return path_decode(pb_get(PB_SEL_PATH))
+
+
+def cur_prefix():
+    """The current browse folder, decoded. Stored encoded for the same reason."""
+    return path_decode(pb_get(PB_PREFIX))
 
 
 # --- UI helpers -----------------------------------------------------------
@@ -161,7 +207,8 @@ def present_toast(message, duration=6, action_title=None, action_id=None):
 
 def feed_table(tsv_text):
     subprocess.run([DIALOG_TOOL, WINDOW_UUID, str(ID_TABLE), "omc_table_set_rows_from_stdin"],
-                   input=tsv_text.encode("utf-8"), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                   input=tsv_text.encode("utf-8", "surrogateescape"),
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 def clear_table():
@@ -195,7 +242,7 @@ def get_view_value(view_id):
 def run_ziptool(*args, stdin=None, capture=True, stream_stdout=False):
     cmd = [PYTHON3, ZIPTOOL] + [str(a) for a in args]
     log("ziptool: %s" % " ".join(cmd))
-    inp = stdin.encode("utf-8") if stdin else None
+    inp = stdin.encode("utf-8", "surrogateescape") if stdin else None
     if stream_stdout:
         # Let ziptool's stdout reach our own stdout (fd 1) untouched so OMC's
         # PROGRESS parser sees the live "file N of M" lines; capture stderr only.
@@ -307,9 +354,11 @@ def _probe(arc):
 
 # --- Population / navigation ---------------------------------------------
 def populate_level(prefix):
-    pb_set(PB_PREFIX, prefix)
+    # Stored encoded: the pasteboard cannot hold invalid UTF-8, and an encoded
+    # value also survives a folder name containing a tab or newline.
+    pb_set(PB_PREFIX, path_encode(prefix))
     r = run_ziptool("level", "--tsv=%s" % tsv_path(), "--prefix=%s" % prefix)
-    feed_table((r.stdout or b"").decode("utf-8", "replace"))
+    feed_table((r.stdout or b"").decode("utf-8", "surrogateescape"))
     if prefix:
         set_breadcrumb("/" + prefix)
         enable_view(ID_UP_BTN, True)
@@ -323,7 +372,7 @@ def populate_level(prefix):
 
 def populate_filter(query):
     r = run_ziptool("find", "--tsv=%s" % tsv_path(), "--query=%s" % query)
-    feed_table((r.stdout or b"").decode("utf-8", "replace"))
+    feed_table((r.stdout or b"").decode("utf-8", "surrogateescape"))
     set_breadcrumb("Filter: " + query)
     enable_view(ID_UP_BTN, False)
     enable_view(ID_EXTRACT_BTN, False)
@@ -332,7 +381,7 @@ def populate_filter(query):
 
 
 def nav_up():
-    prefix = pb_get(PB_PREFIX)
+    prefix = cur_prefix()
     if not prefix:
         return
     inner = prefix.rstrip("/")
@@ -493,12 +542,25 @@ def new_archive_with(content_path):
     set_status("New archive from %s - Save to keep it." % os.path.basename(content_path.rstrip("/")))
 
 
-def _status_summary(verb):
+MODEL_COLS = 7   # keep in sync with ziptool.MODEL_COLS
+
+
+def _read_model_rows():
+    """Parse the cached model file: MODEL_COLS NUL-terminated fields per record.
+    Not line-based - a zip name may legally contain a newline."""
     try:
-        with open(tsv_path(), "r", encoding="utf-8", errors="replace") as f:
-            n = sum(1 for line in f if line.strip())
+        with open(tsv_path(), "rb") as f:
+            fields = f.read().split(b"\0")
     except OSError:
-        n = 0
+        return []
+    if fields and fields[-1] == b"":
+        fields.pop()
+    return [[x.decode("utf-8", "surrogateescape") for x in fields[i:i + MODEL_COLS]]
+            for i in range(0, len(fields) - (MODEL_COLS - 1), MODEL_COLS)]
+
+
+def _status_summary(verb):
+    n = len(_read_model_rows())
     enc = pb_get(PB_ENC)
     # libarchive does not expose the cipher (AES vs ZipCrypto) on read, so the
     # status reports encryption generically.
@@ -509,7 +571,7 @@ def _status_summary(verb):
 # --- Mutations ------------------------------------------------------------
 def add_paths(paths, prefix=None):
     if prefix is None:
-        prefix = pb_get(PB_PREFIX)
+        prefix = cur_prefix()
 
     if pb_get(PB_ENC) == "encrypted":
         # Adding to an encrypted archive must preserve the all-or-nothing invariant:
@@ -555,12 +617,12 @@ def add_paths(paths, prefix=None):
 
     mark_dirty()
     regenerate_model()
-    populate_level(pb_get(PB_PREFIX))
+    populate_level(cur_prefix())
     _status_summary("Added to")
 
 
 def delete_selected():
-    sel = pb_get(PB_SEL_PATH)
+    sel = sel_path()
     isdir = pb_get(PB_SEL_ISDIR)
     if not sel:
         return
@@ -579,7 +641,7 @@ def delete_selected():
         return
     mark_dirty()
     regenerate_model()
-    populate_level(pb_get(PB_PREFIX))
+    populate_level(cur_prefix())
     if r.returncode == 5:
         detail = (r.stderr or b"").decode("utf-8", "replace").strip()
         log("partial delete: %s" % detail)
@@ -802,9 +864,9 @@ def do_extract():
     if mode == "all":
         args.append("--all")
     elif pb_get(PB_SEL_ISDIR) == "1":
-        args += ["--prefix=%s" % pb_get(PB_SEL_PATH)]
+        args += ["--prefix=%s" % sel_path()]
     else:
-        args += ["--entry=%s" % pb_get(PB_SEL_PATH)]
+        args += ["--entry=%s" % sel_path()]
 
     pw = pb_get(PB_PASSWORD)
     if enc == "encrypted" and not pw:
@@ -848,7 +910,7 @@ def do_extract():
             base = os.path.basename(arc)
             intended = base[:-4] if base.lower().endswith(".zip") else base
         else:
-            intended = os.path.basename(pb_get(PB_SEL_PATH).rstrip("/"))
+            intended = os.path.basename(sel_path().rstrip("/"))
         msg = "Extracted %d item%s to %s" % (count, "" if count == 1 else "s", root)
         if os.path.basename(root) != intended:
             msg += "  (renamed to avoid overwriting)"
@@ -901,14 +963,9 @@ def refresh_lock_menu():
 
 def first_encrypted_entry():
     """Full path of the first encrypted file entry in the cached model, or None."""
-    try:
-        with open(tsv_path(), "r", encoding="utf-8", errors="replace") as f:
-            for line in f:
-                parts = line.rstrip("\n").split("\t")
-                if len(parts) >= 6 and parts[1] == "0" and parts[5] == "1":
-                    return parts[0]
-    except OSError:
-        pass
+    for parts in _read_model_rows():
+        if len(parts) >= 6 and parts[1] == "0" and parts[5] == "1":
+            return parts[0]
     return None
 
 
@@ -961,6 +1018,6 @@ def do_recrypt(mode, new_pw):
     pb_set(PB_PASSWORD, new_pw if mode != "none" else "")
     mark_dirty()
     regenerate_model()          # re-probes encryption -> updates PB_ENC
-    populate_level(pb_get(PB_PREFIX))
+    populate_level(cur_prefix())
     refresh_lock_menu()
     return True
