@@ -48,10 +48,10 @@ The `archive` helper links the same system `libarchive` that backs `bsdtar` and 
 |---|---|---|
 | archive | `Contents/Helpers/archive` | Reads and extracts encrypted (AES / ZipCrypto) zip entries via libarchive, taking the passphrase on stdin; source in `archive/` |
 
-The bundled binary and the embedded Python runtime are not committed to the repository (`Contents/Helpers/` and `Contents/Library/Python` are gitignored). Build and install the helper with:
+The bundled binary and the embedded Python runtime are not committed to the repository (`Contents/Helpers/` and `Contents/Library/Python` are gitignored). Build the helper, embed it, and re-sign the app in one step with:
 
 ```bash
-./archive/build.sh install
+./update_zip.sh
 ```
 
 ---
@@ -77,7 +77,16 @@ Zip is an OMC 5.1 applet. The OMC framework handles the app lifecycle, the docum
 
 ## Building and Signing
 
-Build the `archive` helper (see [`archive/README.md`](archive/README.md)) and install it into the bundle with `./archive/build.sh install`. After changing scripts, UI JSON, or the helper, re-sign the bundle so the signature stays valid:
+`./update_zip.sh` is the whole build: it builds the `archive` helper (see [`archive/README.md`](archive/README.md)), embeds it in `Contents/Helpers/`, re-signs the bundle, and verifies the embedded binary still answers to every verb and flag the scripts emit.
+
+```bash
+./update_zip.sh                                            # ad-hoc (local use)
+./update_zip.sh --identity="Developer ID Application: ..."  # for distribution
+./update_zip.sh --debug                                    # embed a debug helper (do not ship)
+./update_zip.sh --skip-build                               # re-sign only, reusing the embedded helper
+```
+
+After changing scripts or UI JSON without touching the helper, `--skip-build` is enough to re-seal the bundle. `update_zip.sh` delegates signing to `codesign_applet.sh`, which can also be run directly:
 
 ```bash
 ./codesign_applet.sh Zip.app -                                    # ad-hoc (local use)

@@ -38,18 +38,23 @@ staged paths afterwards (see `Scripts/ziptool.py`).
 ## Build
 
 ```
-./build.sh            # universal (arm64 + x86_64), ad-hoc signed, -> ./build/archive
-./build.sh install    # also copy into ../Zip.app/Contents/Helpers/archive
+./build.sh            # same as 'release'
+./build.sh release    # universal (arm64 + x86_64), -Os, stripped -> ./build/release/archive
+./build.sh debug      # native arch only, -O0 -g, with a .dSYM  -> ./build/debug/archive
 ```
 
 The source is C++17 (`clang++ -std=c++17`), with no dependency beyond the
-system `libarchive` and the standard library.
+system `libarchive` and the standard library. Both configurations are ad-hoc
+signed.
 
-After `install`, re-seal the app so the bundle signature covers the new binary:
+The release build strips local symbols with `-Wl,-x` during the link rather than
+with `strip(1)` afterwards, because running `strip` on an already-signed binary
+invalidates its signature.
 
-```
-appletbuilder build ../Zip.app
-```
+`build.sh` builds the tool and nothing else - it does not know that Zip.app
+exists. To build the helper and embed it in the app, run `../update_zip.sh` from
+the repository root; that script also re-signs the bundle and verifies the
+embedded binary.
 
 ## Notes
 
