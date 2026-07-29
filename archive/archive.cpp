@@ -269,11 +269,46 @@ bool is_passphrase_error(struct archive *a)
            strcasestr(m, "incorrect password") != nullptr;
 }
 
+/* The cause to append after a zip WRITER's message: ": No space left on
+ * device", or "" when there is nothing to add. The file I/O callbacks behind
+ * the writer record messages as terse as "Write error", with the cause the
+ * user can act on (ENOSPC, EACCES) only in archive_errno(); the reader and
+ * write_disk sides usually embed it in the message text, so they keep plain
+ * errstr, and the strstr guard covers any writer message that does the same.
+ *
+ * Only the suffix lives here, never the message: the message can carry a full
+ * path (PATH_MAX is 1024 on macOS), so copying it through a fixed buffer cut
+ * off exactly the cause this helper exists to add - fprintf streams the
+ * unbounded message from errstr() and this suffix separately. Static buffer,
+ * no allocation: callers include the path between a failed close and the
+ * unlink of the half-written output, which an exception must not skip. Valid
+ * until the next errcause or libarchive call, so consume it in the same
+ * fprintf as errstr(a) - safe in either evaluation order, because the two
+ * return disjoint storage and neither call mutates the archive.
+ *
+ * Only a POSITIVE errno is translated: archive_errno() also carries
+ * libarchive's negative ARCHIVE_ERRNO_* pseudo-codes (see archive.h) for
+ * failures that have no system errno - the message is already complete then,
+ * and strerror could only render the code as "Unknown error: -1". */
+const char *errcause(struct archive *a)
+{
+    static char buf[128];
+    const char *m = errstr(a);
+    int en = archive_errno(a);
+    const char *sys = (en > 0) ? strerror(en) : nullptr;
+    if (sys == nullptr || strstr(m, sys) != nullptr)
+        return "";
+    snprintf(buf, sizeof buf, ": %s", sys);
+    return buf;
+}
+
 ArchiveReadPtr open_archive(const char *path, const std::string &pass)
 {
     ArchiveReadPtr a(archive_read_new());
-    if (!a)
+    if (!a) {
+        fprintf(stderr, "archive: out of memory\n");
         return nullptr;
+    }
     archive_read_support_format_zip(a.get());
     archive_read_support_filter_all(a.get());
     if (has_passphrase(pass))
@@ -835,7 +870,7 @@ int cmd_extract(const char *path, const char *destdir, const std::vector<const c
     NameMap nm;
 
     struct archive_entry *e;
-    int rc = 0, r = ARCHIVE_EOF, count = 0, skipped = 0, renamed = 0, unnamed = 0;
+    int rc = 0, r = ARCHIVE_EOF, count = 0, files = 0, skipped = 0, renamed = 0, unnamed = 0;
     try {
     /* ARCHIVE_WARN from next_header means "header read, something about it was
      * odd" - the entry is complete and usable. Treating it as the end of the
@@ -998,10 +1033,13 @@ int cmd_extract(const char *path, const char *destdir, const std::vector<const c
         }
         /* One stdout line per extracted file/symlink (dirs excluded) so the
          * caller can turn the stream into live progress. The line carries only
-         * the running number - entry names could contain newlines and corrupt
-         * the line-per-file contract. */
+         * the running number OF THESE LINES - entry names could contain
+         * newlines and corrupt the line-per-file contract, and <count> counts
+         * directories too, so printing it made the values skip ("1", "3")
+         * whenever a directory intervened. */
         if (progress && !S_ISDIR(archive_entry_filetype(e))) {
-            printf("%d\n", count + 1);
+            files++;
+            printf("%d\n", files);
             fflush(stdout);
         }
         count++;
@@ -1083,8 +1121,10 @@ void put_field(const char *s)
 int cmd_list(const char *path, bool nul)
 {
     ArchiveReadPtr a(archive_read_new());
-    if (!a)
+    if (!a) {
+        fprintf(stderr, "archive: out of memory\n");
         return 1;
+    }
     archive_read_support_format_zip(a.get());
     archive_read_support_filter_all(a.get());
     if (archive_read_open_filename(a.get(), path, BLOCK) != ARCHIVE_OK) {
@@ -1229,20 +1269,24 @@ ArchiveWritePtr open_zip_writer(const char *dst, const char *mode, const std::st
         return nullptr;
     }
     ArchiveWritePtr w(archive_write_new());
-    if (!w)
+    if (!w) {
+        fprintf(stderr, "archive: out of memory\n");
         return nullptr;
+    }
     archive_write_set_format_zip(w.get());
     if (want_enc) {
         const char *opt = (strcmp(mode, "aes256") == 0) ? "zip:encryption=aes256"
                                                         : "zip:encryption=zipcrypt";
         if (archive_write_set_options(w.get(), opt) != ARCHIVE_OK) {
-            fprintf(stderr, "archive: encryption option rejected: %s\n", errstr(w.get()));
+            fprintf(stderr, "archive: encryption option rejected: %s%s\n",
+                    errstr(w.get()), errcause(w.get()));
             return nullptr;
         }
         archive_write_set_passphrase(w.get(), pass.c_str());
     }
     if (archive_write_open_filename(w.get(), dst) != ARCHIVE_OK) {
-        fprintf(stderr, "archive: cannot create %s: %s\n", dst, errstr(w.get()));
+        fprintf(stderr, "archive: cannot create %s: %s%s\n", dst,
+                errstr(w.get()), errcause(w.get()));
         return nullptr;
     }
     return w;
@@ -1299,7 +1343,7 @@ int cmd_recrypt(const char *src, const char *dst, const char *mode,
             break;
         }
         if (archive_write_header(w.get(), e) != ARCHIVE_OK) {
-            fprintf(stderr, "archive: write header: %s\n", errstr(w.get()));
+            fprintf(stderr, "archive: write header: %s%s\n", errstr(w.get()), errcause(w.get()));
             rc = 1;
             break;
         }
@@ -1311,7 +1355,7 @@ int cmd_recrypt(const char *src, const char *dst, const char *mode,
             }
         }
         if (werr) {
-            fprintf(stderr, "archive: write data: %s\n", errstr(w.get()));
+            fprintf(stderr, "archive: write data: %s%s\n", errstr(w.get()), errcause(w.get()));
             rc = 1;
             break;
         }
@@ -1334,8 +1378,17 @@ int cmd_recrypt(const char *src, const char *dst, const char *mode,
         fprintf(stderr, "archive: read error: %s\n", errstr(a.get()));
     }
 
-    if (archive_write_close(w.get()) != ARCHIVE_OK && rc == 0)
+    /* A close failure needs its reason printed HERE: a small archive sits in
+     * libarchive's write buffer in full until this final flush, so disk-full
+     * surfaces at close - and this command then exited 1 with an EMPTY stderr
+     * (measured on a full volume), telling the user nothing at all. The writer
+     * still holds the message; it is gone once <w> is reset. When rc is already
+     * nonzero the first failure is the actionable one and was already reported,
+     * so the close failure stays quiet. */
+    if (archive_write_close(w.get()) != ARCHIVE_OK && rc == 0) {
+        fprintf(stderr, "archive: close: %s%s\n", errstr(w.get()), errcause(w.get()));
         rc = 1;
+    }
     w.reset();                         /* flush and release before unlinking */
     if (rc != 0) unlink(dst);          /* same reason as cmd_create */
     if (rc == 0)
@@ -1443,7 +1496,7 @@ int cmd_create(const char *dst, const char *manifest, const char *mode, const st
             break;
         }
         if (archive_write_header(w.get(), e.get()) != ARCHIVE_OK) {
-            fprintf(stderr, "archive: write header: %s\n", errstr(w.get()));
+            fprintf(stderr, "archive: write header: %s%s\n", errstr(w.get()), errcause(w.get()));
             rc = 1;
             break;
         }
@@ -1458,7 +1511,7 @@ int cmd_create(const char *dst, const char *manifest, const char *mode, const st
             while ((got = fread(buf.data(), 1, buf.size(), in.get())) > 0) {
                 la_ssize_t nw = archive_write_data(w.get(), buf.data(), got);
                 if (nw < 0) {
-                    fprintf(stderr, "archive: write data: %s\n", errstr(w.get()));
+                    fprintf(stderr, "archive: write data: %s%s\n", errstr(w.get()), errcause(w.get()));
                     rc = 1;
                     break;
                 }
@@ -1495,8 +1548,17 @@ int cmd_create(const char *dst, const char *manifest, const char *mode, const st
         fprintf(stderr, "archive: %s\n", ex.what());
         rc = 1;
     }
-    if (archive_write_close(w.get()) != ARCHIVE_OK && rc == 0)
+    /* A close failure needs its reason printed HERE: a small archive sits in
+     * libarchive's write buffer in full until this final flush, so disk-full
+     * surfaces at close - and this command then exited 1 with an EMPTY stderr
+     * (measured on a full volume), telling the user nothing at all. The writer
+     * still holds the message; it is gone once <w> is reset. When rc is already
+     * nonzero the first failure is the actionable one and was already reported,
+     * so the close failure stays quiet. */
+    if (archive_write_close(w.get()) != ARCHIVE_OK && rc == 0) {
+        fprintf(stderr, "archive: close: %s%s\n", errstr(w.get()), errcause(w.get()));
         rc = 1;
+    }
     w.reset();                         /* flush and release before unlinking */
     /* Never leave a half-written archive behind for the caller to mistake for a
      * real one - the same cleanup do_recrypt does on the Python side. */
