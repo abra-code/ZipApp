@@ -73,6 +73,9 @@ namespace {
 
 constexpr size_t BLOCK = 16384;
 
+/* A zip's name-length field is 16 bits wide. See the check in cmd_create. */
+constexpr size_t ZIP_NAME_MAX = 65535;
+
 struct ArchiveReadDeleter {
     /* archive_read_free() closes first if the archive is still open, so an early
      * return needs no separate archive_read_close(). The read side never checks
@@ -292,11 +295,13 @@ int cmd_read(const char *path, const char *entry, long long maxbytes, const std:
 
     struct archive_entry *e;
     int rc = 1;  /* entry not found, unless we find it */
+    bool found = false;
     int r;
     /* ARCHIVE_WARN: header read, entry usable - see cmd_extract. */
     while ((r = archive_read_next_header(a.get(), &e)) == ARCHIVE_OK || r == ARCHIVE_WARN) {
         if (!name_eq(archive_entry_pathname(e), entry))
             continue;
+        found = true;
         char buf[BLOCK];
         long long written = 0;
         la_ssize_t n;
@@ -323,11 +328,21 @@ int cmd_read(const char *path, const char *entry, long long maxbytes, const std:
         }
         break;
     }
-    /* A header-level failure before the entry was found. The reason has to be
-     * printed here: this is the only exit that would otherwise say nothing at
-     * all, and "exit 1, empty stderr" gives the caller and the user nothing to
-     * act on. cmd_list has always printed it; these paths never did. */
-    if (r < ARCHIVE_OK && r != ARCHIVE_EOF && rc == 1) {
+    /* A header-level failure BEFORE the entry turned up. The reason has to be
+     * printed: this is the only exit that would otherwise say nothing at all,
+     * and "exit 1, empty stderr" gives the caller and the user nothing to act
+     * on. cmd_list has always printed it; this path never did.
+     *
+     * The <found> flag, not <r>, is what makes it safe. Once the loop has been
+     * left by the break below, <r> still holds the value that produced the
+     * MATCHED entry - and that is ARCHIVE_WARN (-20, which is < ARCHIVE_OK) for
+     * any entry whose header warned, the ordinary case in exactly the legacy
+     * archives this tool exists for. Testing <r> alone therefore fires after a
+     * successful match and reports the reader's stale warning string: doubling
+     * a read error that was already printed above, or - worse - blaming the
+     * reader for a short write to stdout, which is the misattribution copy_data
+     * was just fixed to stop making. */
+    if (!found && r < ARCHIVE_OK && r != ARCHIVE_EOF) {
         rc = is_passphrase_error(a.get()) ? 2 : 1;
         fprintf(stderr, "archive: read error: %s\n", errstr(a.get()));
     }
@@ -1162,6 +1177,42 @@ int cmd_list(const char *path, bool nul)
 
 /* ---- write path: create / recrypt ----------------------------------------- */
 
+/* Refuse an entry whose name the zip writer cannot store, and say so.
+ *
+ * A zip keeps each name's length in 16 bits and libarchive enforces nothing: at
+ * exactly 65536 the length wraps to zero and the name spills into the
+ * extra-field region, so the command exits 0 having written an archive this
+ * tool cannot even list; a little further and libarchive memcpy's the name off
+ * the end of the 64KB chunk cd_alloc handed it (measured - heap-buffer-overflow
+ * in copy_path, WRITE of size 65538 past a 65536-byte region).
+ *
+ * The length has to be measured HERE, on the entry as the writer will receive
+ * it, not on whatever string the name came from:
+ *
+ *   - the writer appends a '/' to a directory name that lacks one, so a name
+ *     measured before that is a byte short - a 65535-byte directory name from a
+ *     manifest became 65536 and produced exactly the corrupt archive above;
+ *   - on macOS the READER grows names, so a source entry that is entirely legal
+ *     can arrive oversized. libarchive NFD-normalizes a UTF-8 name on read, and
+ *     NFD is longer: every precomposed "e-acute" (2 bytes) becomes "e" plus a
+ *     combining accent (3 bytes). A 43692-byte name - well inside the format
+ *     limit, so nothing rejects it on the way in - reaches the writer as 65538.
+ *     That is a hostile ARCHIVE overflowing the heap through recrypt, needing no
+ *     manifest and no unusual invocation. */
+bool name_too_long_for_zip(struct archive_entry *e)
+{
+    const char *nm = archive_entry_pathname(e);
+    if (nm == nullptr)
+        return false;                   /* the NULL-name check owns that case */
+    size_t n = strlen(nm);
+    if (S_ISDIR(archive_entry_filetype(e)) && (n == 0 || nm[n - 1] != '/'))
+        n++;                            /* the writer will add the slash */
+    if (n <= ZIP_NAME_MAX)
+        return false;
+    fprintf(stderr, "archive: entry name too long (%zu bytes, max %zu)\n", n, ZIP_NAME_MAX);
+    return true;
+}
+
 /* Open a zip writer for <dst> with encryption <mode> ("aes256"|"zipcrypt"|"none")
  * and an in-memory passphrase. Fails closed: an encryption mode with no
  * passphrase, an unknown mode, or an encryption option the library rejects all
@@ -1234,6 +1285,16 @@ int cmd_recrypt(const char *src, const char *dst, const char *mode,
         if (archive_entry_pathname(e) == nullptr) {
             fprintf(stderr, "archive: an entry name could not be decoded; "
                             "refusing to rewrite this archive\n");
+            rc = 1;
+            break;
+        }
+        /* Fails closed for the same reason as the NULL name above, and it is the
+         * SOURCE archive that decides this one: the reader's NFD normalization
+         * can hand us a name too long for any zip to hold, and passing it on
+         * would either corrupt the rewritten archive or write past the end of
+         * libarchive's buffer. recrypt replaces the user's archive, so it must
+         * not produce one at all rather than produce a broken one. */
+        if (name_too_long_for_zip(e)) {
             rc = 1;
             break;
         }
@@ -1332,6 +1393,15 @@ int cmd_create(const char *dst, const char *manifest, const char *mode, const st
         }
         std::string arcname = line.substr(0, tab);
         std::string srcpath = line.substr(tab + 1);
+        /* A zip stores each name's length in 16 bits, so 65535 bytes is the
+         * format's hard maximum and libarchive does not check it. At exactly
+         * 65536 the length wraps to zero and the name spills into the extra-field
+         * region, producing a CORRUPT archive that this tool then cannot list -
+         * at exit 0. Past roughly 70000 it is memory-unsafe: libarchive memcpy's
+         * the name straight off the end of the 64KB chunk cd_alloc handed it
+         * (measured - heap-buffer-overflow in copy_path, WRITE of size 200000
+         * after a 65536-byte region). The old fgets(char[8192]) capped this by
+         * accident; nothing has since. */
 
         /* lstat, not stat: a symlink must be archived as a symlink entry, never
          * silently replaced by its target (duplicated framework binaries broke
@@ -1363,6 +1433,14 @@ int cmd_create(const char *dst, const char *manifest, const char *mode, const st
             }
             target[tl] = '\0';
             archive_entry_set_symlink(e.get(), target);
+        }
+        /* After copy_stat, so the entry knows it is a directory and the slash the
+         * writer will append is counted. Measuring <arcname> instead let a
+         * 65535-byte directory name through, which the writer then stored as
+         * 65536 - the silent-corruption case this check exists to stop. */
+        if (name_too_long_for_zip(e.get())) {
+            rc = 1;
+            break;
         }
         if (archive_write_header(w.get(), e.get()) != ARCHIVE_OK) {
             fprintf(stderr, "archive: write header: %s\n", errstr(w.get()));
