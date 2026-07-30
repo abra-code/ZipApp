@@ -1144,7 +1144,8 @@ def main(argv):
     g.add_argument("--prefix")
     sp.add_argument("--pwd-stdin", action="store_true", dest="pwd_stdin")
     sp.add_argument("--result-file", dest="result_file",
-                    help="write the '<count>\\t<path>' summary here instead of stdout")
+                    help="write the NUL-framed '<count> <path> <skipped> <renamed>' "
+                         "summary here instead of stdout")
     sp.set_defaults(fn=cmd_extract)
 
     sp = sub.add_parser("create")

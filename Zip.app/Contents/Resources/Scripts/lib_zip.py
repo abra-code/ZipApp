@@ -422,6 +422,78 @@ def _file_describe(buf):
     return (mime, desc)
 
 
+def consume_result_file(path):
+    """Parse ziptool's --result-file summary into (count, root, skipped, renamed),
+    or None when it is missing or carries no count and path. The file is a
+    throwaway both callers write only to read back once, so it is removed here -
+    on every path, including a parse that raises.
+
+    The fields are NUL-framed: the path field holds a user-chosen destination, and
+    a TAB in a folder name split it across two fields, so `skipped` was read from
+    the tail of the path and parsed as 0 - a partial extraction reported as
+    complete. A path cannot contain NUL. The older tab-separated form is still
+    accepted, including its shorter 2- and 3-field variants.
+
+    Decoding is surrogateescape for the same reason the model file's is: an entry
+    name need not be UTF-8, and a strict decode raised UnicodeDecodeError out of a
+    caller that was only guarding against OSError.
+
+    One parser for both callers on purpose - the preview pane kept reading the tab
+    form after the writer moved to NUL and silently previewed nothing.
+    """
+    # newline="" disables universal-newline translation, which would rewrite a CR
+    # in the path to LF and a CRLF to a single LF. The path field is the user's
+    # chosen destination and a CR is legal in a folder name; translating it hands
+    # back a path that does not exist, so "Show in Finder" answered a successful
+    # extraction with "The extracted item is no longer there." Nothing in the
+    # framing can survive the reader rewriting bytes underneath it.
+    try:
+        with open(path, "r", encoding="utf-8", errors="surrogateescape",
+                  newline="") as f:
+            raw = f.read()
+    except OSError:
+        return None
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    if "\0" in raw:
+        # Every record the writer emits ends in NUL, so one that does not was cut
+        # short mid-write. Taking the fields that did land would report a partial
+        # extraction as a complete measurement and stash a truncated path for
+        # "Show in Finder" - the exact failure this framing exists to prevent -
+        # and it would do so by bypassing the no-summary branch that handles it.
+        if not raw.endswith("\0"):
+            return None
+        parts = raw.split("\0")
+        parts.pop()                       # trailing terminator, not a field
+        # All four fields or none. Only the tab form ever had 2- and 3-field
+        # variants to stay compatible with; a NUL record short of four fields was
+        # cut at a field boundary, and reading what landed is the same wrong
+        # answer as reading a record cut anywhere else.
+        if len(parts) < 4:
+            return None
+    else:
+        parts = raw.strip().split("\t")
+    # An empty path field is no more usable than a missing one: it reaches the
+    # reporting as "Extracted 5 items to " and puts "" in PB_EX_LAST for Reveal.
+    if len(parts) < 2 or not parts[0].isdigit() or not parts[1]:
+        return None
+    # isdigit() is not int()-safe: it is true for superscript and circled digits,
+    # which int() rejects, and for a 4400-digit run, which trips CPython's
+    # conversion limit. The writer only ever emits str(int), so this guards a
+    # corrupt or foreign file rather than a reachable case - but the exception
+    # would escape a caller that only expects a value back.
+    try:
+        count = int(parts[0])
+        skipped = int(parts[2]) if len(parts) >= 3 and parts[2].isdigit() else 0
+        renamed = int(parts[3]) if len(parts) >= 4 and parts[3].isdigit() else 0
+    except ValueError:
+        return None
+    return (count, parts[1], skipped, renamed)
+
+
 def extract_for_preview(entry, pw):
     """Quietly extract a single file entry to the per-document preview scratch
     dir and return the extracted file path, or None on failure. Only the current
@@ -442,24 +514,29 @@ def extract_for_preview(entry, pw):
     if pw:
         args.append("--pwd-stdin")
     r = run_ziptool(*args, stdin=(pw or None))
-    root = None
-    try:
-        with open(rf_path, "r", encoding="utf-8") as f:
-            parts = f.read().strip().split("\t")
-        if len(parts) >= 2 and parts[0].isdigit():
-            root = parts[1]
-    except OSError:
-        pass
-    finally:
-        try:
-            os.remove(rf_path)
-        except OSError:
-            pass
+    summary = consume_result_file(rf_path)
+    root = summary[1] if summary is not None else None
     # 5 is a partial extraction; for a single-entry preview it still means this
     # entry landed, so the preview is valid.
-    if r.returncode in (0, 5) and root and os.path.exists(root):
-        return root
-    return None
+    #
+    # A regular file and nothing else, checked WITHOUT following a link: exists()
+    # follows, and a zip may legally store an entry that IS a symlink, which
+    # libarchive restores as one. An entry named "readme.txt" pointing at
+    # /etc/passwd or ~/.ssh/id_rsa would then be opened, described by file(1) and
+    # rendered in the Quick Look pane - reading a file outside the archive from a
+    # single click on an ordinary looking row.
+    #
+    # The directory case is not hypothetical either: an archive holding both a
+    # file "foo" and an explicit "foo/" record makes ziptool reroute --entry to
+    # prefix mode, so root comes back as a subtree while the row still looks like
+    # a plain file. That path then raised IsADirectoryError on the read below and
+    # handed a folder to the preview view. Preview shows the archive's own bytes
+    # or nothing.
+    if r.returncode not in (0, 5) or not root:
+        return None
+    if os.path.islink(root) or not os.path.isfile(root):
+        return None
+    return root
 
 
 def describe_and_preview(fullpath, isdir, enc):
@@ -951,47 +1028,47 @@ def do_extract():
     if pw:
         args.append("--pwd-stdin")
     # ziptool streams "file N of M" progress lines to stdout (parsed live by OMC's
-    # PROGRESS) and writes its "<count>\t<top-level path>\t<skipped>" summary to
-    # this result file. The path is Finder-style: auto-renamed if a same-name item
-    # already existed.
+    # PROGRESS) and writes its "<count> <top-level path> <skipped> <renamed>"
+    # summary to this result file, NUL-framed. The path is Finder-style:
+    # auto-renamed if a same-name item already existed.
     rf = tempfile.NamedTemporaryFile(prefix="zipresult-", delete=False)
     rf_path = rf.name
     rf.close()
     args += ["--result-file=%s" % rf_path]
     r = run_ziptool(*args, stdin=(pw or None), stream_stdout=True)
     rc = r.returncode
-    count, root, skipped, renamed = 0, dest, 0, 0
-    try:
-        with open(rf_path, "r", encoding="utf-8", errors="surrogateescape") as f:
-            raw = f.read()
-        # NUL-framed: the path field carries the user's chosen destination, and a
-        # TAB in a folder name split it in two, so `skipped` came from the tail of
-        # the path and parsed as 0 - a PARTIAL extraction shown as complete. A
-        # path cannot contain NUL. Falls back to the older tab form.
-        if "\0" in raw:
-            parts = raw.split("\0")
-            if parts and parts[-1] == "":
-                parts.pop()
-        else:
-            parts = raw.strip().split("\t")
-        # Tolerate the older 2- and 3-field summaries as well as the 4-field one.
-        if len(parts) >= 2 and parts[0].isdigit():
-            count, root = int(parts[0]), parts[1]
-        if len(parts) >= 3 and parts[2].isdigit():
-            skipped = int(parts[2])
-        if len(parts) >= 4 and parts[3].isdigit():
-            renamed = int(parts[3])
-    except OSError:
-        pass
-    finally:
-        try:
-            os.remove(rf_path)
-        except OSError:
-            pass
+    # No summary means ziptool could not write one (its temp dir gone, disk full,
+    # killed before the write) - NOT that nothing was extracted. The fallback
+    # tuple below is a placeholder, never a measurement: presented as fact it
+    # announces "Extracted 0 items" for a run that did place files, and at rc 5 it
+    # states skipped == 0 when rc 5 is the helper's own word that entries were
+    # rejected - the one thing the reporting here exists to never do.
+    summary = consume_result_file(rf_path)
+    count, root, skipped, renamed = summary if summary is not None else (0, dest, 0, 0)
     # rc 5 means a PARTIAL extraction: entries were rejected (unsafe path, name
     # collision) but everything else is on disk and placed. Report it as a
     # success that names its own shortfall - never as a clean, complete run.
-    if rc in (0, 5):
+    if rc in (0, 5) and summary is None:
+        # Report only what rc still proves: the extraction ran, and at 5 it left
+        # entries behind. The count, the skipped total and the placed path are all
+        # unknown here, so none of them is stated as fact - and the rename note
+        # below cannot be judged either, since it compares a path we do not have.
+        set_status("Extracted to %s%s"
+                   % (root, " - some entries were skipped" if rc == 5 else ""))
+        pb_set(PB_EX_LAST, root)
+        present_toast("Extracted" + (", some entries skipped" if rc == 5 else ""),
+                      6, "Show in Finder", "Zip.reveal")
+        log("extract: no result summary (rc=%s): %s"
+            % (rc, (r.stderr or b"").decode("utf-8", "replace")))
+        if rc == 5:
+            # The whole destination, not its basename: root is the chosen folder
+            # rather than a placed item here, and that path comes from the folder
+            # chooser unnormalized - a trailing slash made basename() return "",
+            # so the alert named nothing at all. It is also the more useful of the
+            # two when the placed item's own name is what we failed to learn.
+            alert("Some entries could not be extracted. The rest was extracted to %s"
+                  % root, level="caution")
+    elif rc in (0, 5):
         if mode == "all":
             base = os.path.basename(arc)
             intended = base[:-4] if base.lower().endswith(".zip") else base
