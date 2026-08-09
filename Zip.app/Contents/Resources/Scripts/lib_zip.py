@@ -47,7 +47,12 @@ ID_LOCK_MENU = 36
 ID_UNLOCK = 37
 ID_ENCRYPT = 38
 ID_CHANGE_PW = 39
-ID_FILTER = 40
+# No ID_FILTER. The search field is the window's "searchable" modifier, and that
+# modifier takes only "prompt" and "actionID" - ActionUI gives it no id, so there
+# is nothing for omc_dialog_control to address. Clearing it on load is therefore
+# not expressible; a stale query stays in the box until the user clears it, and
+# Zip.filter.changed restores the current folder as soon as it goes empty. This
+# used to be ID_FILTER = 40, written to on every load, addressing nothing.
 ID_REMOVE_ENC = 41
 ID_UP_BTN = 50
 ID_BREADCRUMB = 51
@@ -591,7 +596,6 @@ def load_archive(path):
     pb_set(PB_SEL_PATH, "")
     pb_set(PB_SEL_ISDIR, "")
     regenerate_model()
-    set_value(ID_FILTER, "")
     populate_level("")
     enable_view(ID_EXTRACT_ALL_BTN, True)
     enable_view(ID_ADD_BTN, True)
@@ -611,7 +615,6 @@ def new_archive():
     run_ziptool("create", dest, "--force")
     pb_set(PB_WORK, dest)
     regenerate_model()
-    set_value(ID_FILTER, "")
     populate_level("")
     enable_view(ID_EXTRACT_ALL_BTN, True)
     enable_view(ID_ADD_BTN, True)
