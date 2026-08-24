@@ -1,4 +1,5 @@
 # Zip
+![Zip Icon](Icon/Bolt-macOS-256x256@1x.png)
 
 A native macOS zip archive manager. Open a `.zip`, browse its contents in a Finder-like window, and extract, add, delete, or encrypt entries — including AES-encrypted archives that the stock tools handle awkwardly or not at all. Zip is a document-based editor: changes are staged and written back on save.
 
