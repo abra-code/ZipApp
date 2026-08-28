@@ -9,7 +9,7 @@ Subcommands (see argparse below):
   read    <archive> --entry E [--pwd-stdin] [--max N]   entry bytes to stdout (preview)
   extract <archive> --dest D (--all | --entry E | --prefix P) [--pwd-stdin]
   create  <archive> [--force]             create an empty archive
-  add     <archive> [--prefix P]          add files (paths on stdin) in place
+  add     <archive> [--prefix P] [--progress]  add files (paths on stdin) in place
   delete  <archive> (--entry E | --prefix P)
 
 Design notes:
@@ -25,11 +25,14 @@ Design notes:
   * Extraction sanitizes member names to stay within the destination (zip-slip).
 
 Exit codes: 0 ok | 1 generic error | 2 needs/incorrect password | 4 not a valid zip
-            5 extract only: partial - some entries were rejected (unsafe path,
-              name collision) but the rest extracted and are placed on disk
+            5 partial - extract: some entries were rejected (unsafe path, name
+              collision) but the rest extracted and are placed on disk; add:
+              some items did not make it into the archive but the rest did
+            6 add only: too little free space to do this safely (nothing written)
 """
 
 import argparse
+import collections
 import os
 import re
 import shutil
@@ -63,6 +66,27 @@ MODEL_COLS = 7
 # rather than on every file, so OMC's PROGRESS parser refreshes in batches instead
 # of redrawing on each item.
 PROGRESS_EVERY = 10
+
+# The same idea for `add`, at the scale `add` works on: compressing a source tree
+# routinely means six figures of items, where a line per item would have OMC
+# re-rendering the bar tens of thousands of times for one pixel of travel.
+ADD_PROGRESS_EVERY = 200
+
+# The scan that walks the sources has no total to count against - discovering the
+# total IS the work - so it reports a running tally instead. That line
+# deliberately does NOT match the counter regex; it lands in the progress
+# dialog's status area as text while the bar waits.
+SCAN_PROGRESS_EVERY = 2000
+
+
+def progress_line(verb, n, total):
+    """One 'Verb file N of M' line for OMC's DETERMINATE_COUNTER.
+
+    `total` is clamped up to `n`: a count must never exceed its own range, and
+    the two are measured separately (items staged vs. entries Info-ZIP reports
+    storing), so they can legitimately disagree by a few."""
+    print("%s file %d of %d" % (verb, n, max(total, n)))
+    sys.stdout.flush()
 
 # Native libarchive helper at Contents/Helpers/archive; this file is at
 # Contents/Resources/Scripts/.
@@ -226,22 +250,49 @@ def cmd_list(args):
     # NUL-terminated fields per record.
     for r in rows:
         out.write("\0".join(r) + "\0")
+    # The two facts the caller otherwise had to re-derive by parsing the model
+    # back in - how many entries there are, and whether any of them is encrypted.
+    # On a large archive that parse costs more than this whole command: 180k
+    # records is 34 MB and over a million Python strings, and it used to happen
+    # twice (once here as a separate `probe` run, once per status update).
+    # stderr, so the model on stdout stays exactly the model.
+    eprint("entries %d" % len(rows))
+    eprint("encryption %s"
+           % ("encrypted" if any(r[1] != "1" and r[5] == "1" for r in rows)
+              else "plain"))
     return 0
 
 
 # --------------------------------------------------------------------------- level / find
 
-def read_model(tsv_path):
-    """Parse the cached model: MODEL_COLS NUL-terminated fields per record."""
+def read_model_fields(tsv_path):
+    """The cached model as RAW FIELDS - MODEL_COLS NUL-terminated per record.
+
+    Undecoded on purpose. Both callers are filters that keep a few hundred rows
+    out of the whole archive, and decoding every field first was the bulk of
+    what a navigation step cost: on a 181,665-entry model that is 1.27 million
+    strings built to throw all but a few away. Splitting is one C-level call and
+    stays; the decoding moves to the rows that survive the filter (see
+    decode_row)."""
     with open(tsv_path, "rb") as f:
         fields = f.read().split(b"\0")
     if fields and fields[-1] == b"":
         fields.pop()
-    rows = []
-    for i in range(0, len(fields) - (MODEL_COLS - 1), MODEL_COLS):
-        rows.append([x.decode("utf-8", "surrogateescape")
-                     for x in fields[i:i + MODEL_COLS]])
-    return rows
+    return fields
+
+
+def decode_row(fields, i):
+    """One model record, decoded. surrogateescape for the reason every name in
+    this file is: an entry name need not be valid UTF-8."""
+    return [x.decode("utf-8", "surrogateescape") for x in fields[i:i + MODEL_COLS]]
+
+
+def read_model(tsv_path):
+    """The whole cached model, decoded. For callers that really do want every
+    row; the filters use read_model_fields and decode what they keep."""
+    fields = read_model_fields(tsv_path)
+    return [decode_row(fields, i)
+            for i in range(0, len(fields) - (MODEL_COLS - 1), MODEL_COLS)]
 
 
 def display_name(fullpath, isdir):
@@ -302,22 +353,26 @@ def sort_key(row):
 
 def cmd_level(args):
     prefix = args.prefix or ""
-    rows = read_model(args.tsv)
+    # Matched on the RAW BYTES and decoded only where it matches. The rule is
+    # the same as it always was - a child of this folder and no deeper - but it
+    # is now asked of 181,665 byte strings instead of 1.27 million decoded ones,
+    # which is the difference between navigation feeling instant and not.
+    prefix_b = prefix.encode("utf-8", "surrogateescape")
+    cut = len(prefix_b)
+    fields = read_model_fields(args.tsv)
     children = []
-    for r in rows:
-        fp, isdir = r[0], r[1]
-        if fp == prefix or not fp.startswith(prefix):
+    for i in range(0, len(fields) - (MODEL_COLS - 1), MODEL_COLS):
+        fp = fields[i]
+        if fp == prefix_b or not fp.startswith(prefix_b):
             continue
-        rem = fp[len(prefix):]
-        if isdir == "1":
-            # immediate dir child: rem like "name/"
-            inner = rem[:-1]
-            if "/" in inner:
+        rem = fp[cut:]
+        if fields[i + 1] == b"1":
+            # immediate dir child: rem like b"name/"
+            if b"/" in rem[:-1]:
                 continue
-        else:
-            if "/" in rem:
-                continue
-        children.append(r)
+        elif b"/" in rem:
+            continue
+        children.append(decode_row(fields, i))
     children.sort(key=sort_key)
 
     out = sys.stdout
@@ -332,10 +387,33 @@ def cmd_level(args):
 
 def cmd_find(args):
     q = (args.query or "").lower()
-    rows = read_model(args.tsv)
     if not q:
         return 0
-    matches = [r for r in rows if r[1] == "0" and q in r[0].lower()]
+    # Same treatment as cmd_level, and the same reason: a search matches a
+    # handful of rows out of the archive and used to decode every one of them to
+    # find out - on every keystroke, since the search field fires as it is
+    # typed.
+    #
+    # The cheap byte test is only trusted where it is EXACT: an ASCII needle
+    # against an ASCII name, where bytes.lower() and str.lower() agree
+    # character for character. Anything non-ASCII on either side is decoded and
+    # matched properly, because byte-lowering does not case-fold beyond A-Z -
+    # "E-acute" would fail a byte test that its decoded form passes, and
+    # skipping it would silently drop a real hit from the results. Most archive
+    # names are ASCII, so nearly all rows still take the cheap path.
+    q_b = q.encode("utf-8", "surrogateescape")
+    q_is_ascii = q.isascii()
+    fields = read_model_fields(args.tsv)
+    matches = []
+    for i in range(0, len(fields) - (MODEL_COLS - 1), MODEL_COLS):
+        if fields[i + 1] != b"0":
+            continue
+        fp = fields[i]
+        if q_is_ascii and fp.isascii() and q_b not in fp.lower():
+            continue
+        row = decode_row(fields, i)
+        if q in row[0].lower():
+            matches.append(row)
     matches.sort(key=lambda r: r[0].lower())
     out = sys.stdout
     for r in matches:
@@ -723,7 +801,7 @@ def cmd_create(args):
     return 0
 
 
-def _additions_from_sources(sources, prefix):
+def _additions_from_sources(sources, prefix, progress=False):
     """Yield (source_file, arcname) pairs. A folder keeps its own name as the
     root under prefix; a file is stored as prefix + basename.
 
@@ -733,6 +811,18 @@ def _additions_from_sources(sources, prefix):
     frameworks) depend on those links; following or dropping them breaks
     code signatures ("unsealed contents" from duplicated framework binaries)."""
     pairs = []
+    total_bytes = 0
+    scanned = 0
+
+    def tick():
+        # Only the tally is reported: an item's name could carry a newline and
+        # forge a progress line of its own, and a running count cannot.
+        if progress and len(pairs) >= scanned + SCAN_PROGRESS_EVERY:
+            print("Scanning: %d items found" % len(pairs))
+            sys.stdout.flush()
+            return len(pairs)
+        return scanned
+
     for src in sources:
         src = src.rstrip("/")
         if not src or not os.path.lexists(src):
@@ -742,10 +832,12 @@ def _additions_from_sources(sources, prefix):
         if os.path.isdir(src) and not os.path.islink(src):
             parent = os.path.dirname(src)
             for root, dirs, files in os.walk(src):
+                scanned = tick()
                 for fn in files:
                     full = os.path.join(root, fn)
                     rel = os.path.relpath(full, parent)   # keeps 'base/...'
                     pairs.append((full, prefix + rel.replace(os.sep, "/")))
+                    total_bytes += _staged_size(full) or 0
                 for d in dirs:
                     full = os.path.join(root, d)
                     if os.path.islink(full):
@@ -760,7 +852,11 @@ def _additions_from_sources(sources, prefix):
                     pairs.append((root, prefix + rel.replace(os.sep, "/")))
         else:
             pairs.append((src, prefix + base))
-    return pairs
+            if not os.path.islink(src):
+                total_bytes += _staged_size(src) or 0
+    # The byte total is what the space preflight judges: it is the archive's
+    # worst case, the size it would come to if nothing compressed at all.
+    return pairs, total_bytes
 
 
 def _fold(s):
@@ -908,10 +1004,21 @@ def cmd_add(args):
     if not sources:
         eprint("no sources on stdin")
         return 1
-    to_add = _additions_from_sources(sources, args.prefix or "")
+    progress = getattr(args, "progress", False)
+    to_add, source_bytes = _additions_from_sources(sources, args.prefix or "",
+                                                   progress=progress)
     if not to_add:
         eprint("nothing to add")
         return 1
+    shortfall = _space_shortfall(args.archive, source_bytes, sources,
+                                 getattr(args, "min_free_bytes", 0))
+    if shortfall is not None:
+        free, needed = shortfall
+        # Counters last and on their own line, for the same reason every other
+        # count in this file is: the lines above may carry a source path.
+        eprint("not enough free space to compress this safely")
+        eprint("space %d %d %d" % (source_bytes, free, needed))
+        return 6
     to_add, repaired = _resolve_arcnames(to_add, args.prefix or "", args.archive)
     if to_add is None:
         return 4
@@ -923,6 +1030,19 @@ def cmd_add(args):
     # such by zip -y.
     staging = tempfile.mkdtemp(prefix="zipadd-")
     staged = 0
+    # The archive names that really made it into the staging dir, which is not
+    # every name in to_add - the collision guards below skip some. Only these can
+    # be expected in the archive afterwards, so only these are what the outcome
+    # is verified against.
+    staged_names = []
+    # What Info-ZIP will actually store, which is more than what is staged: the
+    # parent directories makedirs creates on the way are entries too. Counting
+    # only the staged items put the compression bar at 100% with a third of the
+    # tree still to go, which is its own kind of "it looks stuck".
+    staged_files = 0
+    staged_dirs = set()
+    missing = []
+    partial = False
     try:
         for full, arc in to_add:
             dst = os.path.join(staging, arc)
@@ -939,6 +1059,11 @@ def cmd_add(args):
                     continue
                 os.symlink(os.readlink(full), dst)
                 staged += 1
+                staged_files += 1
+                staged_names.append((arc, None))     # a symlink: nothing to size
+                staged_dirs.update(_parent_dirs(arc))
+                if progress and staged % ADD_PROGRESS_EVERY == 0:
+                    progress_line("Preparing", staged, len(to_add))
                 continue
             if os.path.isdir(full):
                 # exist_ok tolerates an existing DIRECTORY only; a file already
@@ -949,6 +1074,11 @@ def cmd_add(args):
                     continue
                 os.makedirs(dst, exist_ok=True)   # empty dir: shape only, no data
                 staged += 1
+                staged_names.append((arc, None))     # a directory has no content
+                staged_dirs.add(arc.rstrip("/"))
+                staged_dirs.update(_parent_dirs(arc))
+                if progress and staged % ADD_PROGRESS_EVERY == 0:
+                    progress_line("Preparing", staged, len(to_add))
                 continue
             if os.path.lexists(dst):
                 eprint("skip: %s is already staged" % arc)
@@ -958,18 +1088,374 @@ def cmd_add(args):
             except OSError:
                 shutil.copy2(full, dst)
             staged += 1
-        archive_abs = os.path.abspath(args.archive)
-        r = subprocess.run(["/usr/bin/zip", "-r", "-q", "-X", "-y", archive_abs, "."],
-                           cwd=staging, capture_output=True)
-        if r.returncode != 0:
-            eprint(_msg(r.stderr) or _msg(r.stdout))
-            return 1
+            staged_files += 1
+            # The size the archive must report for this entry afterwards. See
+            # _unstored_items: a NAME being present proves nothing when the
+            # archive already held an entry of that name.
+            staged_names.append((arc, _staged_size(full)))
+            staged_dirs.update(_parent_dirs(arc))
+            if progress and staged % ADD_PROGRESS_EVERY == 0:
+                progress_line("Preparing", staged, len(to_add))
+        if progress:
+            progress_line("Preparing", staged, staged)
+        rc, detail, copied_over = _run_zip_add(
+            args.archive, staging, staged_files + len(staged_dirs), progress)
+        if rc != 0:
+            # Info-ZIP exits non-zero for WARNINGS as well as failures - a file
+            # whose size changed while it was being read, one it could not open -
+            # having written every other entry perfectly well. Scoring that as a
+            # plain failure threw away a completed multi-minute add and told the
+            # user nothing had been stored, which was false. Ask the archive what
+            # it actually holds instead; the exit code only decides how hard to
+            # look, never what to report.
+            stored = _stored_entries(args.archive)
+            if stored is None:
+                eprint(detail or "zip exited %d" % rc)
+                eprint("the archive could not be read back after zip exited %d" % rc)
+                return 1
+            missing = _unstored_items(staged_names, stored, copied_over)
+            # A copy-over report that matches no staged name means the line was
+            # cut - an entry name may contain a newline, and the folder being
+            # added into is deliberately never repaired, so zip's warning can
+            # arrive as two fragments and the true name never reach us. We
+            # cannot say WHICH entry it was, only that one of them was not
+            # replaced, so the run is reported as partial rather than clean.
+            accounted = set()
+            for name, _sz in staged_names:
+                accounted.update(_match_keys(name))
+            unaccounted = set(copied_over) - accounted
+            if detail:
+                eprint(detail)
+            if unaccounted and not missing:
+                eprint("the zip tool kept an existing entry it could not name "
+                       "back to us")
+                eprint("missing 1 of %d items" % len(staged_names))
+                partial = True
+            else:
+                partial = bool(missing)
+            if missing:
+                # Names first, the count last: an entry NAME can contain a
+                # newline and so can forge a whole line of its own, and the two
+                # counts below are what the applet parses. Everything a name can
+                # reach is printed before them, so the LAST match of each
+                # pattern is the true one - the same rule the rename count has
+                # always relied on.
+                for name in missing[:20]:
+                    eprint("could not add: %s" % name)
+                eprint("missing %d of %d items" % (len(missing), len(staged_names)))
     finally:
         shutil.rmtree(staging, ignore_errors=True)
+    if len(missing) == len(staged_names) and staged_names:
+        # Nothing landed, so the caller's model is still accurate. Deliberately
+        # no "added N item(s)" here: it printed on this path too, and it is the
+        # last stderr line, so the failure alert quoted it as its own reason and
+        # read "Could not add the selected items. / added 3 item(s)".
+        eprint("nothing was added")
+        return 1
     eprint("added %d item(s)" % staged)
-    if repaired:
-        eprint("%d name%s changed to fit the archive" % (repaired, "" if repaired == 1 else "s"))
-    return 0
+    # Unconditional, including the zero: this is the LAST line on every path the
+    # caller parses, and _added_under_other_names takes the last match of it. An
+    # entry name reaching stderr above can forge a line that looks like this
+    # one, and if the true line were omitted the forgery would be the only
+    # match - a rename alert for renames that never happened.
+    eprint("%d name%s changed to fit the archive" % (repaired, "" if repaired == 1 else "s"))
+    # 5 = the archive WAS modified, just not with everything, so the caller must
+    # refresh its model and treat the document as changed.
+    return 5 if partial else 0
+
+
+def free_bytes(path):
+    """Free space on the volume holding `path`, or None if it cannot be asked.
+
+    The nearest EXISTING directory is measured, because the path in question is
+    routinely one that has not been created yet - a working copy in a document
+    directory, or a Save As destination in a folder chosen a moment ago."""
+    path = _nearest_dir(path)
+    if path is None:
+        return None
+    try:
+        st = os.statvfs(path)
+    except OSError:
+        return None
+    # f_bavail, not f_bfree: the blocks available to THIS user, which is what a
+    # write will actually get.
+    return st.f_bavail * st.f_frsize
+
+
+def _nearest_dir(path):
+    """The nearest existing directory at or above `path`, or None."""
+    path = os.path.abspath(path)
+    while path and not os.path.isdir(path):
+        parent = os.path.dirname(path)
+        if parent == path:
+            return None
+        path = parent
+    return path
+
+
+def _sources_cross_device(staging_dir, sources):
+    """True when staging cannot hardlink, so it has to COPY the sources.
+
+    os.link fails EXDEV across volumes, and cmd_add falls back to copy2 - so
+    compressing a folder that lives on another disk writes the whole of it into
+    the staging volume, where the hardlink case writes nothing at all. That is
+    the everyday "compress this folder on my external drive" shape, and a
+    preflight that assumes hardlinks underestimates it by the entire source."""
+    try:
+        staging_dev = os.stat(staging_dir).st_dev
+    except OSError:
+        return False
+    for src in sources:
+        try:
+            if os.lstat(src).st_dev != staging_dev:
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _space_requirements(archive, source_bytes, sources):
+    """{device: (a path on it, bytes it must have free)} for this add.
+
+    Keyed by device rather than by path so that two directories on the same
+    volume - which the archive and the staging dir usually are - are added up
+    against one measurement instead of each being judged as if it had the whole
+    disk to itself."""
+    need = {}
+
+    def add(path, count):
+        if count <= 0:
+            return
+        where = _nearest_dir(path)
+        if where is None:
+            return
+        try:
+            dev = os.stat(where).st_dev
+        except OSError:
+            return
+        previous = need.get(dev, (where, 0))
+        need[dev] = (previous[0], previous[1] + count)
+
+    try:
+        existing = os.path.getsize(archive)
+    except OSError:
+        existing = 0
+    # The archive's volume holds the new archive AND, while Info-ZIP rewrites
+    # through a temp file beside it, the old one at the same time.
+    add(os.path.dirname(os.path.abspath(archive)) or ".", source_bytes + existing)
+    staging_dir = tempfile.gettempdir()
+    if _sources_cross_device(staging_dir, sources):
+        add(staging_dir, source_bytes)
+    return need
+
+
+def _space_shortfall(archive, source_bytes, sources, headroom):
+    """(free, needed) for the worst-off volume this add would touch, or None.
+
+    Judged against the UNCOMPRESSED total, which is the archive's worst case -
+    the size it comes to if nothing compresses at all. That is deliberately
+    pessimistic and the caller treats the answer as a question, not a verdict:
+    a folder of text usually lands at a fraction of it, and refusing outright
+    would block operations that fit comfortably.
+
+    Room for one archive is not the whole story, which is what _space_requirements
+    is for: Info-ZIP rewrites the archive through a temp file beside it and
+    renames at the end, so an update briefly holds two copies (measured on a
+    9.8 MB archive, the directory peaked at source + archive + a second
+    archive), and staging copies rather than hardlinks when the sources are on
+    another volume. On top of all of it sits the headroom macOS needs for swap
+    and caches - a Mac driven to zero stops working rather than merely being
+    full."""
+    if headroom <= 0:
+        return None
+    worst = None
+    for where, count in _space_requirements(archive, source_bytes, sources).values():
+        free = free_bytes(where)
+        if free is None:
+            continue
+        needed = count + headroom
+        if free < needed and (worst is None or (needed - free) > (worst[1] - worst[0])):
+            worst = (free, needed)
+    return worst
+
+
+def _parent_dirs(arc):
+    """Every ancestor directory of an archive name, as its own name. These are
+    entries in the archive in their own right - staging creates them with
+    makedirs and Info-ZIP stores each one - so a count of what zip will write
+    has to include them."""
+    parts = arc.rstrip("/").split("/")
+    return ["/".join(parts[:i]) for i in range(1, len(parts))]
+
+
+# Info-ZIP's own admission that an entry's CONTENT was not replaced: it keeps
+# the existing entry and says so. The line names the entry relative to the
+# staging dir, which is its archive name.
+ZIP_COPIED_OVER = b"zip warning: will just copy entry over: "
+
+
+def _run_zip_add(archive, staging, expected, progress):
+    """Run Info-ZIP over the staging dir. Returns (exit code, diagnostic text,
+    set of archive names whose content zip did NOT replace).
+
+    `expected` is how many entries zip is expected to report storing - staged
+    files and symlinks plus every directory in their paths - and is only ever
+    the progress bar's range.
+
+    zip's stdout is READ AS IT COMES rather than captured at the end: without -q
+    it prints a line per entry, which for a source tree of any size overruns the
+    64 KB pipe buffer and deadlocks - zip blocked writing, us blocked waiting for
+    it to exit. Those lines are what the progress bar is counted from, so -q is
+    not an option either. stderr goes to a file for the same reason.
+
+    stdin is /dev/null: zip prompts on some conditions, and inheriting the
+    handler's stdin (already drained of the source list) would hang the applet
+    on a question no one can see."""
+    cmd = ["/usr/bin/zip", "-r", "-X", "-y", os.path.abspath(archive), "."]
+    errf = tempfile.TemporaryFile()
+    try:
+        proc = subprocess.Popen(cmd, cwd=staging, stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=errf)
+        # zip writes its warnings and errors to stdout too, mixed in with the
+        # per-entry lines, so the tail of what is not an entry line is the
+        # diagnostic. Bounded: a run can emit one warning per entry.
+        tail = collections.deque(maxlen=20)
+        copied_over = set()
+        done = 0
+        for line in proc.stdout:
+            # "  adding: name (deflated 12%)" for a new entry, "updating: ..."
+            # for one that replaces an existing entry. A name containing a
+            # newline can forge such a line, which is why this only ever drives
+            # a counter that is clamped to its own range - never a decision.
+            if line.startswith(b"  adding: ") or line.startswith(b"updating: "):
+                done += 1
+                if progress and (done % ADD_PROGRESS_EVERY == 0 or done >= expected):
+                    progress_line("Compressing", done, expected)
+                continue
+            line = line.rstrip(b"\r\n")
+            if not line.strip():
+                continue
+            tail.append(line)
+            # "...will just copy entry over: <name>" means the existing entry
+            # SURVIVED - zip could not read the replacement. It still rewrites
+            # the entry's header from the staged file, so the archive ends up
+            # claiming the new size over the old bytes, and neither the name nor
+            # the size can tell afterwards that the update did not happen.
+            # zip's own word is the only evidence, so it is collected here.
+            at = line.find(ZIP_COPIED_OVER)
+            if at != -1:
+                # NOT stripped. A leading or trailing space is a legal zip name
+                # and staging preserves it, so trimming here made the key miss
+                # the staged name it has to match - and a miss means a real
+                # copy-over goes unreported, which is the direction that hurts.
+                # The line has already had its CR/LF removed.
+                copied_over.add(_fold(
+                    line[at + len(ZIP_COPIED_OVER):]
+                    .decode("utf-8", "surrogateescape").rstrip("/")))
+        rc = proc.wait()
+        if progress and done:
+            progress_line("Compressing", done, done)
+        errf.seek(0)
+        err = errf.read()
+    finally:
+        errf.close()
+    if rc == 0:
+        return 0, "", copied_over
+    return rc, (_msg(err) or _msg(b"\n".join(tail)) or "zip exited %d" % rc), copied_over
+
+
+def _staged_size(path):
+    """The size the archive should report for this source file, or None when it
+    cannot be measured (in which case the entry is verified by name alone)."""
+    try:
+        return os.lstat(path).st_size
+    except OSError:
+        return None
+
+
+def _stored_entries(archive):
+    """{folded name: (is a directory, size or None)} for everything the archive
+    holds, or None if it cannot be read.
+
+    Folded the same way staging collisions are (NFC + casefold): the staging
+    filesystem may have normalized a name on the way through, and an add that
+    really did land must not be reported missing over that."""
+    listed = _archive_list(archive, raw=True)
+    if listed is None:
+        return None
+    out = {}
+    for name, isdir, size, _mt, _enc, _ad in listed:
+        if name.startswith("./"):
+            name = name[2:]
+        try:
+            value = None if isdir == "1" else int(size)
+        except (TypeError, ValueError):
+            value = None
+        out[_fold(name.rstrip("/"))] = (isdir == "1", value)
+    return out
+
+
+def _unstored_items(staged, stored, copied_over=()):
+    """Which of the staged (name, expected size) pairs did NOT reach the archive
+    with our content.
+
+    A NAME being present is not evidence on its own, and neither is its size.
+    Two ways an add can leave the old content under the right name:
+
+      * zip cannot read the replacement, so it keeps the existing entry - and
+        rewrites that entry's header from the staged file, so the archive
+        reports the NEW size over the OLD bytes. Verified on this machine: a
+        17-byte entry updated by an unreadable 4-byte file listed as 4 bytes
+        with the 17 bytes still in it, and unzip then complained the sizes
+        disagreed. Nothing about the result distinguishes it from a real update
+        - so `copied_over`, the entries zip itself said it only copied, is the
+        evidence, and it is the reason that set is collected at all.
+      * a run that dies before zip renames its temp file over the archive leaves
+        the ORIGINAL untouched, every one of its names still present. There the
+        sizes are the old ones, which is what the size check catches.
+
+    Directories and symlinks have no content of ours to measure and are checked
+    by name. Sizes can still agree by coincidence, so this proves less than
+    reading every entry back would; it is what the archive's own listing can
+    answer at no extra cost, and it turns both failures above from "reported as
+    complete" into "reported as partial".
+
+    The slash-for-backslash spelling is accepted too: libarchive reports a "\\"
+    in a name with no "/" as "/" (a DOS-path heuristic, see _archive_list), so a
+    root-level file named "a\\b.txt" comes back as "a/b.txt" and would
+    otherwise be scored missing though it landed."""
+    out = []
+    for name, expected in staged:
+        for key in _match_keys(name):
+            if key in copied_over:
+                out.append(name)
+                break
+            if key not in stored:
+                continue
+            is_dir, actual = stored[key]
+            # A staged FILE is not vouched for by a directory entry of the same
+            # name: the two fold to one key here, and a directory carries no
+            # size, so a surviving directory would have satisfied both checks.
+            if expected is not None and is_dir:
+                continue
+            if expected is not None and actual is not None and actual != expected:
+                out.append(name)
+            break
+        else:
+            out.append(name)
+    return out
+
+
+def _match_keys(name):
+    """The folded keys an archive may hold this staged name under: its own
+    spelling, and - for a root-level name - the slash-for-backslash spelling
+    libarchive reports it as (see _archive_list). Both are probed against the
+    stored entries AND against zip's copy-over report, because checking one
+    under a key the other was never built with is a silent miss."""
+    keys = [_fold(name.rstrip("/"))]
+    if "/" not in name and "\\" in name:
+        keys.append(_fold(name.replace("\\", "/").rstrip("/")))
+    return keys
 
 
 def zip_pattern(name):
@@ -1156,6 +1642,13 @@ def main(argv):
     sp = sub.add_parser("add")
     sp.add_argument("archive")
     sp.add_argument("--prefix", default="")   # archive folder to add into
+    sp.add_argument("--progress", action="store_true",
+                    help="stream scan/staging/compression progress to stdout for "
+                         "OMC's DETERMINATE_COUNTER")
+    sp.add_argument("--min-free-bytes", dest="min_free_bytes", type=int, default=0,
+                    help="refuse with exit 6 when the volume holding the archive "
+                         "would be left with less than this after storing the "
+                         "sources uncompressed (0 disables the check)")
     sp.set_defaults(fn=cmd_add)
 
     sp = sub.add_parser("delete")

@@ -190,7 +190,7 @@ omc_run Zip.save.as
 check "the user was asked"                "1"             "$(alerts_count)"
 check "and asked to replace"              "1"             "$(alerts_mention 'already exists')"
 check "Cancel left the other file alone"  "not an archive" "$(/bin/cat "$OMCTEST_WORK/Existing.zip")"
-check "status says it was canceled"       "Save cancelled" "$(ui_value $ID_STATUS)"
+check "status says it was canceled"       "Save canceled" "$(ui_value $ID_STATUS)"
 check "and the path was not adopted"      "$OMCTEST_WORK/Backup.zip" "$(original)"
 alert_answer 0                                   # Replace
 omc_dialog_answer save_as "$OMCTEST_WORK/Existing"

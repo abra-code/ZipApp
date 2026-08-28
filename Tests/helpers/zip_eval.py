@@ -19,6 +19,12 @@ matters only if something ever pipes this.
 import os
 import sys
 
+# Before any applet code is loaded: importing it would otherwise leave a
+# __pycache__ directory INSIDE the signed app bundle. Those must never be
+# hidden away in .gitignore - a stray .pyc in a bundle is something to see and
+# delete - so the fix is not to create one in the first place.
+sys.dont_write_bytecode = True
+
 _BUNDLE = os.environ.get("OMC_APP_BUNDLE_PATH", "")
 if not _BUNDLE:
     # Without this the join yields a RELATIVE path and "import lib_zip" quietly

@@ -63,7 +63,27 @@ ID_DET_MOD = 63
 ID_DET_ENC = 64
 ID_DET_KIND = 65
 ID_PREVIEW = 70
+# The Preview pane's own indicator: a spinner centered OVER the QuickLook view,
+# in a ZStack with it. Pulling one entry out of a large archive is seconds of
+# work, and the pane sat showing the PREVIOUS selection's contents throughout -
+# so a click read as "nothing happened" until it suddenly did. A spinner rather
+# than the status row's bar because this is a content pane, not a strip: the
+# right shape here is something centered in the space being filled.
+ID_PREVIEW_BUSY = 71
 ID_STATUS = 80
+# The status row's two progress indicators. The test suite imports these by
+# reading bare "ID_NAME = <digits>" lines out of this file, so the note goes
+# above rather than at the end of the line: a trailing comment does not match
+# and the name silently arrives empty.
+# 82 is determinate (a linear bar), 83 indeterminate (a small spinner).
+ID_PROGRESS_BAR = 82
+# The part of the progress message that CHANGES WIDTH as the work runs - the
+# percentage, or the running scan tally. It sits AFTER the indicator, so its
+# width cannot move the indicator; everything to the indicator's left stays the
+# same string for the whole phase. Padding the numbers instead did not work: a
+# space is narrower than a digit in a proportional font, so the text still grew
+# and the bar still walked sideways.
+ID_PROGRESS_DETAIL = 84
 
 # --- Pasteboard keys (per document) --------------------------------------
 PB_WORK = "zip_work_%s" % DOCUMENT_UUID            # working-copy archive path (temp)
@@ -73,6 +93,7 @@ PB_PREFIX = "zip_prefix_%s" % DOCUMENT_UUID        # current browse folder prefi
 PB_SEL_PATH = "zip_sel_path_%s" % DOCUMENT_UUID
 PB_SEL_ISDIR = "zip_sel_isdir_%s" % DOCUMENT_UUID
 PB_ENC = "zip_enc_%s" % DOCUMENT_UUID              # plain | encrypted
+PB_COUNT = "zip_count_%s" % DOCUMENT_UUID          # entries in the cached model
 PB_PASSWORD = "zip_pw_%s" % DOCUMENT_UUID          # session password (cleared on close)
 PB_EX_DEST = "zip_ex_dest_%s" % DOCUMENT_UUID
 PB_EX_MODE = "zip_ex_mode_%s" % DOCUMENT_UUID      # all | selected
@@ -171,6 +192,81 @@ def set_status(msg):
     set_value(ID_STATUS, msg)
 
 
+# --- Progress -------------------------------------------------------------
+# The bar lives in the window's status row rather than in a PROGRESS dialog.
+# OMC's PROGRESS panel is the documented mechanism and it does raise a dialog,
+# but on OMC 5.2.0 that dialog never closes: it was still on screen minutes
+# after the task ended, both on a command of ours and on the untouched
+# Zip.extract.run, and a second run stacks a second panel. A three-minute
+# compression that ends by leaving a dead window behind is worse than no
+# progress at all, so the applet drives its own indicator, which it can also
+# retire on every exit path.
+
+
+# One element for every phase, because ActionUI's ProgressView can now be told
+# to be LINEAR in both states (progressViewStyle, added for this). It is
+# declared with that style and NO "value", so it starts indeterminate - an
+# animated bar rather than a spinner - and a numeric progress state turns it
+# determinate. Before the style existed an indeterminate ProgressView was a
+# circular spinner for life, which forced either a second element (whose hidden
+# slot still reserved the bar's width, stranding the spinner in a gap, because
+# hidden does not collapse layout) or a bar sitting flat at zero through every
+# phase that cannot be counted.
+
+
+def show_bar(fraction=None):
+    """Reveal the status-row bar. `fraction` None leaves it indeterminate, which
+    now still moves - so a phase with nothing to count shows activity rather
+    than an empty track."""
+    set_progress(fraction)
+    show_view(ID_PROGRESS_BAR, True)
+
+
+def set_progress(fraction):
+    """Move the bar, or None to return it to indeterminate.
+
+    "null" for that, which the element reads as no progress. It is also
+    belt-and-braces: were the tool ever to store it as the STRING "null", the
+    Swift side's `states["progress"] as? Double` would still come back nil, and
+    with no "value" in the JSON there is nothing behind it to fall back to - so
+    the element ends up indeterminate either way."""
+    if fraction is None:
+        value = "null"
+    else:
+        value = repr(min(max(float(fraction), 0.0), 1.0))
+    subprocess.run([DIALOG_TOOL, WINDOW_UUID, str(ID_PROGRESS_BAR),
+                    "omc_set_state", "progress", value], capture_output=True)
+
+
+def set_progress_detail(text):
+    """The changing half of the message, to the right of the indicator."""
+    set_value(ID_PROGRESS_DETAIL, text)
+
+
+def hide_progress():
+    """Retire the bar and the detail label. Must run on every exit path from a
+    long operation, including the failures - one left behind says the work is
+    still going, which is the confusion this whole change exists to remove."""
+    show_view(ID_PROGRESS_BAR, False)
+    set_progress_detail("")
+
+
+def show_preview_busy(busy=True):
+    """The Preview pane's spinner. Indeterminate: reading one entry out of a zip
+    gives no progress to report - libarchive walks the archive until it reaches
+    it - so there is a duration but never a fraction.
+
+    It spins over an empty pane: describe_and_preview clears the previous
+    selection before starting, so what is on screen for those seconds is the new
+    row's details and a spinner, never the old row's contents."""
+    show_view(ID_PREVIEW_BUSY, busy)
+
+
+def grouped(n):
+    """1234567 -> "1,234,567". Six-figure item counts are unreadable without it."""
+    return "{:,}".format(n)
+
+
 def arc_location(p):
     """Finder-style in-archive path for the status bar: leading '/', no trailing
     slash; the archive root is '/'."""
@@ -246,7 +342,7 @@ def get_view_value(view_id):
 
 # --- ziptool wrapper ------------------------------------------------------
 def run_ziptool(*args, stdin=None, capture=True, stream_stdout=False,
-                discard_stdout=False):
+                discard_stdout=False, stdout_file=None):
     cmd = [PYTHON3, ZIPTOOL] + [str(a) for a in args]
     log("ziptool: %s" % " ".join(cmd))
     inp = stdin.encode("utf-8", "surrogateescape") if stdin else None
@@ -256,12 +352,110 @@ def run_ziptool(*args, stdin=None, capture=True, stream_stdout=False,
         # memory for output nobody looks at.
         return subprocess.run(cmd, input=inp, stdout=subprocess.DEVNULL,
                               stderr=subprocess.PIPE, text=False)
+    if stdout_file is not None:
+        # Straight into a file: the preview writes an entry's bytes out without
+        # ever holding them in this process, which capture_output would.
+        return subprocess.run(cmd, input=inp, stdout=stdout_file,
+                              stderr=subprocess.PIPE, text=False)
     if stream_stdout:
         # Let ziptool's stdout reach our own stdout (fd 1) untouched so OMC's
         # PROGRESS parser sees the live "file N of M" lines; capture stderr only.
         return subprocess.run(cmd, input=inp, stdout=None, stderr=subprocess.PIPE,
                               text=False)
     return subprocess.run(cmd, input=inp, capture_output=capture, text=False)
+
+
+def run_ziptool_watched(*args, stdin=None, on_line=None):
+    """Run ziptool, handing each stdout line to on_line AS IT ARRIVES.
+
+    Returns the same shape as run_ziptool - a CompletedProcess with returncode
+    and stderr - so callers read the outcome unchanged.
+
+    stderr goes to a temp FILE, never a pipe. ziptool prints a line per renamed
+    item with no matching stdout, so a filled stderr pipe would deadlock against
+    this read loop, which is the same trap cmd_extract avoids on its side."""
+    cmd = [PYTHON3, ZIPTOOL] + [str(a) for a in args]
+    log("ziptool: %s" % " ".join(cmd))
+    errf = tempfile.TemporaryFile()
+    try:
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                                stdout=subprocess.PIPE, stderr=errf)
+        try:
+            if stdin:
+                proc.stdin.write(stdin.encode("utf-8", "surrogateescape"))
+            proc.stdin.close()
+        except (BrokenPipeError, OSError):
+            pass    # child exited early; the return code below reports it
+        for line in proc.stdout:
+            if on_line:
+                on_line(line.decode("utf-8", "replace").rstrip("\r\n"))
+        rc = proc.wait()
+        errf.seek(0)
+        err = errf.read()
+    finally:
+        errf.close()
+    return subprocess.CompletedProcess(cmd, rc, b"", err)
+
+
+# ziptool's progress contract: "<Verb> file <n> of <m>" for a countable phase,
+# "Scanning: <n> items found" for the walk, which has no total until it ends.
+# The scan is a phase like any other, but it has no total to key on.
+_SCANNING = ("Scanning", None)
+
+_PROGRESS_LINE = re.compile(r"^([A-Za-z]+) file (\d+) of (\d+)$")
+_SCAN_LINE = re.compile(r"^Scanning: (\d+) items found$")
+
+
+def progress_reporter():
+    """A ziptool stdout line handler that drives the status row.
+
+    Pushes an update only when the whole percentage changes: each one is a
+    subprocess spawn, and a six-figure add would otherwise spend minutes
+    launching omc_dialog_control to redraw the same pixel.
+
+    Keyed on the phase as well as the percentage. On the percentage alone, a
+    staging phase that ended at 100% silenced the whole of the compression phase
+    that starts again at 0 - so the slowest part of the operation, the one this
+    exists for, reported nothing at all. A phase change always reports, whatever
+    the percentage, because it rewrites the fixed half of the message too."""
+    # The phase is (verb, total) rather than the verb alone: the closing line of
+    # a phase can report a total different from the one its earlier lines used
+    # (items skipped during staging), and that is a new fixed string to show.
+    phase = [None]
+    pct_shown = [-1]
+
+    def report(line):
+        m = _PROGRESS_LINE.match(line)
+        if m:
+            verb, n, total = m.group(1), int(m.group(2)), int(m.group(3))
+            pct = int(n * 100 / total) if total else 0
+            if (verb, total) != phase[0]:
+                # Split either side of the indicator. What is to its LEFT names
+                # the phase and its total and does not change again until the
+                # phase does - so the indicator cannot move while the work runs.
+                # What DOES change goes to its right, where growing by a
+                # character pushes nothing but empty space. Padding the numbers
+                # instead did not work: a space is narrower than a digit in a
+                # proportional font, so the text still grew.
+                phase[0] = (verb, total)
+                pct_shown[0] = -1
+                set_status("%s %s items" % (verb, grouped(total)))
+            elif pct == pct_shown[0]:
+                return
+            pct_shown[0] = pct
+            set_progress(pct / 100.0)
+            set_progress_detail("%d%%" % pct)
+            return
+        m = _SCAN_LINE.match(line)
+        if m:
+            # The walk cannot say how far along it is - finding the total IS the
+            # work - so the bar stays indeterminate and the tally, which is the
+            # part that grows, goes to the right of it.
+            if phase[0] != _SCANNING:
+                phase[0] = _SCANNING
+                set_status("Scanning for items")
+            set_progress_detail("%s found" % grouped(int(m.group(1))))
+    return report
 
 
 # --- Document state -------------------------------------------------------
@@ -349,20 +543,61 @@ def ensure_working_copy():
 
 
 def regenerate_model():
-    """Rebuild the cached entries.tsv from the active archive."""
+    """Rebuild the cached entries.tsv from the active archive.
+
+    Returns the entry count, or None when the archive could not be read - the
+    caller must then not present it as an open document.
+
+    One pass over the archive, not three. Opening used to cost a full read of
+    the central directory for `is_zip`, another to build this model, and a third
+    for a separate `probe` to answer the one yes/no question the model already
+    contains - then a fourth parse of the 34 MB model just to count its rows for
+    the status line. On the archive that prompted this (180k entries) that was
+    the whole of the delay the window sat blank for."""
     arc = active_archive()
     if not arc or not os.path.isfile(arc):
         open(tsv_path(), "w").close()
-        return
+        pb_set(PB_COUNT, "0")
+        pb_set(PB_ENC, "plain")
+        return 0
     r = run_ziptool("list", arc)
+    if r.returncode != 0:
+        log("list failed (rc=%s): %s"
+            % (r.returncode, (r.stderr or b"").decode("utf-8", "replace")))
+        open(tsv_path(), "w").close()
+        pb_set(PB_COUNT, "")
+        return None
     with open(tsv_path(), "wb") as f:
         f.write(r.stdout or b"")
-    pb_set(PB_ENC, _probe(arc))
+    count, enc = _model_facts(r.stderr)
+    pb_set(PB_COUNT, "" if count is None else str(count))
+    pb_set(PB_ENC, enc)
+    return count or 0
 
 
-def _probe(arc):
-    r = run_ziptool("probe", arc)
-    return (r.stdout or b"").decode("utf-8", "replace").strip() or "plain"
+def _model_facts(stderr):
+    """(entry count, "plain"|"encrypted") as ziptool reported them alongside the
+    model it just wrote. Scanned backwards and matched whole-line, for the same
+    reason _added_under_other_names is: take the LAST answer, never a line that
+    merely contains one."""
+    count, enc = None, None
+    for line in reversed((stderr or b"").decode("utf-8", "replace").split("\n")):
+        line = line.rstrip("\r")
+        if count is None:
+            m = re.fullmatch(r"entries (\d+)", line)
+            if m:
+                count = int(m.group(1))
+        if enc is None:
+            m = re.fullmatch(r"encryption (plain|encrypted)", line)
+            if m:
+                enc = m.group(1)
+        if count is not None and enc is not None:
+            break
+    # An unreadable or truncated report must not silently downgrade an encrypted
+    # archive to "plain" - that would enable Encrypt on an archive that already
+    # has a password and hide Unlock. Absent is treated as plain only because
+    # ziptool prints the line unconditionally, so absent means no model at all.
+    return count, enc or "plain"
 
 
 # --- Population / navigation ---------------------------------------------
@@ -499,49 +734,70 @@ def consume_result_file(path):
     return (count, parts[1], skipped, renamed)
 
 
+def _preview_filename(entry):
+    """A filename of OUR choosing for the preview scratch dir.
+
+    The basename only, so no part of the archive's path can steer where the file
+    lands, and every character the filesystem or a path could choke on is folded
+    to "_" - separators, control characters, and the lone surrogates a non-UTF-8
+    archive name arrives as. The EXTENSION is what survives and what matters:
+    QuickLook picks its renderer from it.
+    """
+    base = os.path.basename(entry.rstrip("/"))
+    safe = "".join("_" if (ch in "/\\\0" or ord(ch) < 32 or "\ud800" <= ch <= "\udfff")
+                   else ch for ch in base)
+    # A name that folded away to nothing, or to dots, is not a filename.
+    return (safe[:200] if safe.strip(". ") else "preview")
+
+
 def extract_for_preview(entry, pw):
-    """Quietly extract a single file entry to the per-document preview scratch
-    dir and return the extracted file path, or None on failure. Only the current
-    preview is ever held (the dir is wiped first). Unlike do_extract this shows
-    no progress/toast and never triggers the password prompt - it is safe to call
-    on every selection change to feed the inline Quick Look pane."""
+    """Write one entry's bytes into the per-document preview scratch dir and
+    return the path, or None on failure. Only the current preview is ever held
+    (the dir is wiped first). Shows no toast and never triggers the password
+    prompt - it is safe to call on every selection change.
+
+    Reads the entry directly instead of going through `extract`, which lists the
+    WHOLE archive first - once to total the files for progress, once more to
+    spot an entry that is really a directory. On the archive that prompted this
+    (181,665 entries) that listing was 4.5 of the 7.0 seconds every single click
+    on a row cost, for a 4 KB file. Nothing here needs it: the caller already
+    knows from the model whether the row is a directory, and a preview has no
+    progress to total. The remaining ~2.5 s is libarchive walking the archive to
+    reach the entry, which is the read itself.
+
+    Two hazards the old extract path had to guard against are gone rather than
+    guarded: the bytes land under a name this function chooses, so a preview
+    cannot be made to write outside the scratch dir, and an entry that IS a
+    symlink is written as a regular file holding its target text instead of
+    being restored as a link and then opened - which would have read a file
+    outside the archive from a single click on an ordinary looking row.
+    """
     arc = active_archive()
     if not arc:
         return None
     pdir = preview_dir()
     shutil.rmtree(pdir, ignore_errors=True)   # only ever hold the current preview
-    os.makedirs(pdir, exist_ok=True)
-    rf = tempfile.NamedTemporaryFile(prefix="zipql-", delete=False)
-    rf_path = rf.name
-    rf.close()
-    args = ["extract", arc, "--dest=%s" % pdir, "--entry=%s" % entry,
-            "--result-file=%s" % rf_path]
+    try:
+        os.makedirs(pdir, exist_ok=True)
+    except OSError as e:
+        log("preview: cannot make %s: %s" % (pdir, e))
+        return None
+    dest = os.path.join(pdir, _preview_filename(entry))
+    args = ["read", arc, "--entry=%s" % entry]
     if pw:
         args.append("--pwd-stdin")
-    r = run_ziptool(*args, stdin=(pw or None))
-    summary = consume_result_file(rf_path)
-    root = summary[1] if summary is not None else None
-    # 5 is a partial extraction; for a single-entry preview it still means this
-    # entry landed, so the preview is valid.
-    #
-    # A regular file and nothing else, checked WITHOUT following a link: exists()
-    # follows, and a zip may legally store an entry that IS a symlink, which
-    # libarchive restores as one. An entry named "readme.txt" pointing at
-    # /etc/passwd or ~/.ssh/id_rsa would then be opened, described by file(1) and
-    # rendered in the Quick Look pane - reading a file outside the archive from a
-    # single click on an ordinary looking row.
-    #
-    # The directory case is not hypothetical either: an archive holding both a
-    # file "foo" and an explicit "foo/" record makes ziptool reroute --entry to
-    # prefix mode, so root comes back as a subtree while the row still looks like
-    # a plain file. That path then raised IsADirectoryError on the read below and
-    # handed a folder to the preview view. Preview shows the archive's own bytes
-    # or nothing.
-    if r.returncode not in (0, 5) or not root:
+    try:
+        with open(dest, "wb") as out:
+            r = run_ziptool(*args, stdin=(pw or None), stdout_file=out)
+    except OSError as e:
+        log("preview: cannot write %s: %s" % (dest, e))
         return None
-    if os.path.islink(root) or not os.path.isfile(root):
+    if r.returncode != 0:
+        # Wrong password, an unreadable entry, a method the helper cannot decode.
+        log("preview read failed (rc=%s): %s"
+            % (r.returncode, (r.stderr or b"").decode("utf-8", "replace")))
         return None
-    return root
+    return dest
 
 
 def describe_and_preview(fullpath, isdir, enc):
@@ -553,21 +809,31 @@ def describe_and_preview(fullpath, isdir, enc):
     as README/Makefile/LICENSE is named, not guessed. Folders, and encrypted
     entries before the session password is known, clear the pane.
     """
+    # Cleared FIRST, before anything that takes time, and on every path out of
+    # here. Left until the new bytes arrived, the pane went on showing the
+    # PREVIOUS selection - which on a large archive is seconds of the wrong file
+    # displayed beside the right one's name, size and path in the inspector.
+    # Whether the row that follows is a folder, a locked entry or a file that
+    # takes two seconds to read, the honest thing to show meanwhile is nothing.
+    set_value(ID_PREVIEW, "")
     if isdir == "1":
         set_value(ID_DET_KIND, "Folder")
-        set_value(ID_PREVIEW, "")
         return
     # Encrypted entries preview once the session password is known.
     pw = pb_get(PB_PASSWORD)
     if enc == "1" and not pw:
         set_value(ID_DET_KIND, "Encrypted")
-        set_value(ID_PREVIEW, "")
         return
-    path = extract_for_preview(fullpath, pw)
+    # Raised before the read and lowered after it, on both outcomes.
+    show_preview_busy(True)
+    try:
+        path = extract_for_preview(fullpath, pw)
+    finally:
+        show_preview_busy(False)
     if not path:
         # Extraction failed - on an encrypted entry this means a wrong password.
+        # The pane is already empty; it was cleared on the way in.
         set_value(ID_DET_KIND, "Encrypted" if enc == "1" else "-")
-        set_value(ID_PREVIEW, "")
         return
     try:
         with open(path, "rb") as f:
@@ -581,6 +847,12 @@ def describe_and_preview(fullpath, isdir, enc):
 
 # --- Loading / creating documents ----------------------------------------
 def is_zip(path):
+    """Standalone "can the helper read this as a zip?" check.
+
+    NOT used to open a document: load_archive answers the same question as a
+    by-product of the read it has to do anyway, and asking here first meant
+    reading a large archive's central directory twice for one boolean. Kept for
+    callers that need the answer without opening anything."""
     if not path or not os.path.isfile(path):
         return False
     r = run_ziptool("probe", path)
@@ -588,20 +860,45 @@ def is_zip(path):
 
 
 def load_archive(path):
-    """Open an existing archive for browsing (no working copy yet)."""
-    pb_set(PB_ORIGINAL, path)
-    pb_set(PB_WORK, "")
-    pb_set(PB_DIRTY, "")
-    pb_set(PB_PASSWORD, "")
-    pb_set(PB_SEL_PATH, "")
-    pb_set(PB_SEL_ISDIR, "")
-    regenerate_model()
-    populate_level("")
-    enable_view(ID_EXTRACT_ALL_BTN, True)
-    enable_view(ID_ADD_BTN, True)
-    refresh_title()
-    refresh_lock_menu()
-    _status_summary("Opened")
+    """Open an existing archive for browsing (no working copy yet).
+
+    Returns False, having claimed no document state, when the file is not
+    something the helper can read as a zip - so the caller can fall back to
+    treating it as content to compress. This IS the "is it a zip?" test: asking
+    separately first meant reading the whole central directory twice.
+    """
+    # Said before the read, not after: on a large archive the read is seconds of
+    # a window that otherwise shows "No archive open" and an empty list, which
+    # is indistinguishable from having failed. It is the first thing the user
+    # sees and the reason they thought the app was broken.
+    set_status("Opening %s..." % os.path.basename(path))
+    # Indeterminate: libarchive streams the central directory and cannot say how
+    # many entries are coming until it has read them all, so there is no honest
+    # fraction to show. A spinner still answers the question the blank window
+    # could not - is it working, or has it failed?
+    show_bar()
+    try:
+        pb_set(PB_ORIGINAL, path)
+        pb_set(PB_WORK, "")
+        pb_set(PB_DIRTY, "")
+        pb_set(PB_PASSWORD, "")
+        pb_set(PB_SEL_PATH, "")
+        pb_set(PB_SEL_ISDIR, "")
+        if regenerate_model() is None:
+            pb_set(PB_ORIGINAL, "")
+            pb_set(PB_ENC, "")
+            set_status("")
+            return False
+        set_status("Listing %s..." % os.path.basename(path))
+        populate_level("")
+        enable_view(ID_EXTRACT_ALL_BTN, True)
+        enable_view(ID_ADD_BTN, True)
+        refresh_title()
+        refresh_lock_menu()
+        _status_summary("Opened")
+        return True
+    finally:
+        hide_progress()
 
 
 def new_archive():
@@ -624,10 +921,18 @@ def new_archive():
 
 
 def new_archive_with(content_path):
-    """Create a new untitled document containing a dropped/opened file or folder."""
+    """Create a new untitled document containing a dropped/opened file or folder.
+
+    Compressing a folder is the slowest thing this app does, so add_paths shows
+    the status row's progress bar while it runs."""
     new_archive()
-    add_paths([content_path], prefix="")
-    set_status("New archive from %s - Save to keep it." % os.path.basename(content_path.rstrip("/")))
+    if not add_paths([content_path], prefix=""):
+        # add_paths has already said what went wrong, in the status bar and in
+        # an alert. Overwriting that with "Save to keep it" would invite the
+        # user to save an archive that got nothing.
+        return
+    set_status("New archive from %s - Save to keep it."
+               % os.path.basename(content_path.rstrip("/")))
 
 
 MODEL_COLS = 7   # keep in sync with ziptool.MODEL_COLS
@@ -679,8 +984,28 @@ def _added_under_other_names(r):
     return 0
 
 
+def _add_missing_count(r):
+    """How many staged items ziptool could not find in the archive afterwards.
+
+    Same shape and same reasoning as _added_under_other_names: anchored,
+    whole-line, and scanned BACKWARDS. ziptool names each missing item on its
+    own line before printing this count, and an entry name can contain a
+    newline - so a name can forge a line that looks like this one, and only the
+    LAST match is guaranteed to be ziptool's own."""
+    for line in reversed((r.stderr or b"").decode("utf-8", "replace").split("\n")):
+        m = re.fullmatch(r"missing (\d+) of (\d+) items", line.rstrip("\r"))
+        if m:
+            return int(m.group(1)), int(m.group(2))
+    return 0, 0
+
+
 def _status_summary(verb, note=""):
-    n = len(_read_model_rows())
+    # regenerate_model cached the count, which every caller has just run. Falling
+    # back to parsing the model keeps this correct if that ever stops being true,
+    # but it is the expensive path: 34 MB and a million strings on a large
+    # archive, for one number.
+    cached = pb_get(PB_COUNT)
+    n = int(cached) if cached.isdigit() else len(_read_model_rows())
     enc = pb_get(PB_ENC)
     # libarchive does not expose the cipher (AES vs ZipCrypto) on read, so the
     # status reports encryption generically.
@@ -689,11 +1014,191 @@ def _status_summary(verb, note=""):
 
 
 # --- Mutations ------------------------------------------------------------
+# Free space the applet refuses to compress into, over and above the archive it
+# is about to write. macOS needs room for swap and system caches, and a Mac
+# driven to zero is a Mac that stops working rather than one that is merely
+# full. Named through a variable for the same reason Cadabra names its own: a
+# test cannot free gigabytes, so with the number hardcoded a space test would
+# pass or fail on how full the developer's disk happened to be that day.
+#
+# Smaller than Cadabra's 15 GB on purpose. That figure guards multi-gigabyte
+# model downloads; most archives are far smaller, and a reserve that large would
+# question every compression on a comfortably-working Mac.
+def _headroom_bytes():
+    """The reserve, from the environment, never raising.
+
+    Parsed in a function because this runs at IMPORT: a stray
+    ZIP_DISK_HEADROOM_GB=5.5 or an empty one would otherwise take down every
+    handler in the applet with a traceback, not merely the preflight. A float is
+    accepted for the same reason - refusing "5.5" would be a surprise - and a
+    negative value clamps to 0, which disables the check rather than silently
+    weakening it into nonsense."""
+    try:
+        gb = float(os.environ.get("ZIP_DISK_HEADROOM_GB", "5"))
+    except (TypeError, ValueError):
+        gb = 5.0
+    return int(max(gb, 0.0) * 1024 ** 3)
+
+
+DISK_HEADROOM_BYTES = _headroom_bytes()
+
+_SPACE_LINE = re.compile(r"space (\d+) (\d+) (\d+)")
+
+
+def free_bytes(path):
+    """Free space on the volume holding `path`, or None if it cannot be asked.
+    The nearest EXISTING directory is measured: the path in question is
+    routinely one that does not exist yet, such as a Save As destination.
+
+    Deliberately a second copy of ziptool's function of the same name rather
+    than an import: ziptool is a command run under its own interpreter, not a
+    module this process loads."""
+    path = os.path.abspath(path)
+    while path and not os.path.isdir(path):
+        parent = os.path.dirname(path)
+        if parent == path:
+            return None
+        path = parent
+    try:
+        st = os.statvfs(path)
+    except OSError:
+        return None
+    # f_bavail, not f_bfree: the blocks available to THIS user, which is what a
+    # write actually gets.
+    return st.f_bavail * st.f_frsize
+
+
+def human_bytes(n):
+    """Sizes for a sentence the user reads, not for arithmetic."""
+    n = float(n)
+    for unit in ("bytes", "KB", "MB", "GB", "TB"):
+        if n < 1024.0 or unit == "TB":
+            return "%d %s" % (n, unit) if unit == "bytes" else "%.1f %s" % (n, unit)
+        n /= 1024.0
+
+
+def _confirm_low_space(r):
+    """ziptool refused on space. Show what it measured and ask.
+
+    Asked rather than refused, because the number it judged is the sources'
+    UNCOMPRESSED size - the archive's worst case. A folder of source code
+    routinely lands at a fifth of it, so a flat refusal would block operations
+    that fit with room to spare. What the user cannot see for themselves, and
+    what this is really for, is that the Mac is close enough to full that
+    filling it further is a system problem rather than a Zip problem."""
+    text = (r.stderr or b"").decode("utf-8", "replace")
+    log("space preflight refused: %s" % text)
+    source = free = needed = None
+    for line in reversed(text.split("\n")):
+        m = _SPACE_LINE.fullmatch(line.rstrip("\r"))
+        if m:
+            source, free, needed = (int(g) for g in m.groups())
+            break
+    if source is None:
+        # No measurement to show. Refuse rather than invite a decision nobody
+        # has the facts for.
+        alert("There may not be enough free disk space to do this safely.",
+              level="caution")
+        return False
+    return alert(
+        "Compressing this could leave the disk too full for macOS to work "
+        "comfortably.\n\n"
+        "These items hold %s uncompressed. The archive will be smaller - how "
+        "much smaller is not known until it is written - and the compressed "
+        "copy is written before the originals are freed, so the space is "
+        "needed either way.\n\n"
+        "Free space now: %s\nWanted before starting: %s"
+        % (human_bytes(source), human_bytes(free), human_bytes(needed)),
+        title="Low Disk Space", level="caution",
+        ok="Compress Anyway", cancel="Cancel") == 0
+
+
+def _run_add(archive, prefix, paths):
+    """ziptool's add, with the space preflight in front of it.
+
+    Returns the CompletedProcess, or None when the user answered the low-space
+    question with Cancel. The retry runs the whole add again, scan included:
+    the check happens after the walk (which is where the byte total comes from)
+    and before anything is written, so a second walk is the price of offering
+    the choice at all - and it is only paid when the answer is Yes."""
+    args = ["add", archive, "--prefix=%s" % prefix, "--progress"]
+    payload = "\n".join(paths)
+    r = run_ziptool_watched(*args, "--min-free-bytes=%d" % DISK_HEADROOM_BYTES,
+                            stdin=payload, on_line=progress_reporter())
+    if r.returncode != 6:
+        return r
+    if not _confirm_low_space(r):
+        return None
+    return run_ziptool_watched(*args, stdin=payload, on_line=progress_reporter())
+
+
+def _copy_failed(e):
+    """ensure_working_copy or the encrypted scratch copy could not be made.
+
+    Both duplicate a whole archive before the space preflight has anything to
+    judge - the preflight needs the walk's byte total, and the walk has not run
+    yet - so on a full disk they are where the operation dies. It used to die as
+    an unhandled OSError: no alert, and a status line still saying the applet was
+    compressing."""
+    log("could not prepare the working copy: %s" % e)
+    alert("Could not prepare the archive for editing.\n\n%s" % e, level="caution")
+    set_status("Add failed.")
+
+
+def _adding_status(paths):
+    """What the status bar says while an add runs. Compressing a folder is the
+    slow case and the one worth naming; a multi-item add just gets a count."""
+    if len(paths) == 1:
+        name = os.path.basename(paths[0].rstrip("/")) or paths[0]
+        if os.path.isdir(paths[0]) and not os.path.islink(paths[0]):
+            return "Compressing %s..." % name
+        return "Adding %s..." % name
+    return "Adding %d items..." % len(paths)
+
+
+def _add_failed(r, what="Could not add the selected items."):
+    """Report a failed add with the reason attached.
+
+    The old message said only that it had failed. After a multi-minute
+    compression that is the least useful thing the app can say, and it is what
+    left a real failure with nothing to go on: the exit code and Info-ZIP's own
+    complaint were captured and thrown away."""
+    detail = (r.stderr or b"").decode("utf-8", "replace")
+    log("add failed (rc=%s): %s" % (r.returncode, detail))
+    # The FIRST line, not the last. ziptool prints the zip tool's own complaint
+    # before anything of its own, so the first line is the diagnosis; the last
+    # is bookkeeping ("nothing was added"), which the alert used to quote as
+    # though it were the reason.
+    first = detail.strip().split("\n")[0].strip()
+    why = "The zip tool exited with code %d." % r.returncode
+    if first:
+        why = "%s\n\n%s" % (first, why)
+    alert("%s\n\n%s" % (what, why), level="caution")
+    set_status("Add failed.")
+
+
 def add_paths(paths, prefix=None):
+    """Add the given files/folders to the archive, with live progress.
+
+    Thin wrapper so the status row's progress bar is retired on EVERY exit path
+    - the failures and an unexpected exception included. A bar left standing
+    says the work is still running, which is the exact confusion this whole
+    change exists to remove."""
+    show_bar()
+    try:
+        return _add_paths(paths, prefix)
+    finally:
+        hide_progress()
+
+
+def _add_paths(paths, prefix=None):
     recrypted_note = False
     renamed_note = 0
+    partial = False
     if prefix is None:
         prefix = cur_prefix()
+
+    set_status(_adding_status(paths))
 
     if pb_get(PB_ENC) == "encrypted":
         # Adding to an encrypted archive must preserve the all-or-nothing invariant:
@@ -705,25 +1210,46 @@ def add_paths(paths, prefix=None):
         pw = pb_get(PB_PASSWORD)
         if not pw:
             alert("Unlock this archive before adding files.", level="caution")
-            return
-        work = ensure_working_copy()
+            set_status("Add canceled - the archive is locked.")
+            return False
+        try:
+            work = ensure_working_copy()
+        except OSError as e:
+            _copy_failed(e)
+            return False
         scratch = work + ".addtmp"
         recrypted = scratch + ".recrypt"
         try:
+            # A full copy of the working copy, made BEFORE the preflight can run
+            # - the preflight needs the walk's byte total, which does not exist
+            # yet. This one is exact, so it can be checked exactly.
+            if not _space_for_write(work, scratch):
+                set_status("Compression canceled - not enough free space.")
+                return False
             shutil.copy2(work, scratch)
-            r = run_ziptool("add", scratch, "--prefix=%s" % prefix, stdin="\n".join(paths))
-            if r.returncode != 0:
-                alert("Could not add the selected items.", level="caution")
-                return
+            r = _run_add(scratch, prefix, paths)
+            if r is None:
+                set_status("Compression canceled - not enough free space.")
+                return False
+            # rc 5 is a partial add: some items are in, the rest are not. The
+            # archive on disk changed either way, so it must be carried through
+            # and reported rather than discarded as a failure.
+            if r.returncode not in (0, 5):
+                _add_failed(r)
+                return False
+            partial = (r.returncode == 5)
             renamed_note = _added_under_other_names(r)
             # scratch is now mixed (existing encrypted + new plaintext); re-encrypt all
             # entries under the session password so none is left in the clear.
+            show_bar()                # no counter for this phase
+            set_status("Re-encrypting archive...")
             rr = _run_recrypt(scratch, recrypted, "aes256", pw, pw)
             if rr.returncode != 0:
                 log("encrypted add re-encrypt failed: %s"
                     % (rr.stderr or b"").decode("utf-8", "replace"))
-                alert("Could not add the selected items.", level="caution")
-                return
+                _add_failed(rr, "The items could not be added without leaving part "
+                                "of the archive unencrypted, so nothing was added.")
+                return False
             os.replace(recrypted, work)   # atomic: working copy is fully encrypted again
             recrypted_note = True
         finally:
@@ -733,17 +1259,32 @@ def add_paths(paths, prefix=None):
                 except OSError:
                     pass
     else:
-        work = ensure_working_copy()
-        r = run_ziptool("add", work, "--prefix=%s" % prefix, stdin="\n".join(paths))
-        if r.returncode != 0:
-            alert("Could not add the selected items.", level="caution")
-            return
+        try:
+            work = ensure_working_copy()
+        except OSError as e:
+            _copy_failed(e)
+            return False
+        r = _run_add(work, prefix, paths)
+        if r is None:
+            set_status("Compression canceled - not enough free space.")
+            return False
+        if r.returncode not in (0, 5):
+            _add_failed(r)
+            return False
+        partial = (r.returncode == 5)
         renamed_note = _added_under_other_names(r)
 
     mark_dirty()
+    # Re-reading a freshly written multi-gigabyte archive is seconds of its own,
+    # with no per-item counter to report. Say what is happening and keep the bar
+    # up, spinning, so the window is never silently busy.
+    show_bar()
+    set_status("Updating list...")
     regenerate_model()
     populate_level(cur_prefix())
     note = ""
+    if partial:
+        note += " - some items could not be added"
     if recrypted_note:
         # The whole archive is rewritten as AES-256 regardless of what it was
         # before, so a ZipCrypto archive gets silently upgraded - a security
@@ -755,6 +1296,21 @@ def add_paths(paths, prefix=None):
         note += " - %d item%s stored under a different name" % (
             renamed_note, "" if renamed_note == 1 else "s")
     _status_summary("Added to", note=note)
+    if partial:
+        # Named separately from the rename note below: those items ARE in the
+        # archive under another name, these are not in it at all. ziptool
+        # checked each staged item against the archive's own listing - by name,
+        # and for a file by size too - rather than trusting the zip tool's exit
+        # code, and named the ones that did not make it on stderr.
+        log("partial add: %s" % (r.stderr or b"").decode("utf-8", "replace"))
+        n, total = _add_missing_count(r)
+        # The counts, never a raw stderr line: the line before this one holds an
+        # entry name, which may contain a newline and would put a fragment of
+        # itself in the alert.
+        alert("%s could not be added. The rest are in the archive - check the "
+              "list before saving."
+              % ("%d of %d items" % (n, total) if total else "Some items"),
+              level="caution")
     if renamed_note:
         # ziptool named each one on stderr (kept only when debug logging is on).
         # The alert is the part that matters: without it the sole evidence is an
@@ -773,6 +1329,10 @@ def add_paths(paths, prefix=None):
                  "its" if renamed_note == 1 else "their",
                  "it was" if renamed_note == 1 else "they were",
                  "" if renamed_note == 1 else "s"))
+    # True once anything is in the archive, partial runs included: the document
+    # IS changed and the caller must not overwrite the status with a message
+    # that implies otherwise.
+    return True
 
 
 def delete_selected():
@@ -808,6 +1368,54 @@ def delete_selected():
 
 
 # --- Saving ---------------------------------------------------------------
+def _space_for_write(src, dest):
+    """True if it is safe to write `src`'s bytes to `dest`, having asked first.
+
+    Exact, unlike the compression preflight: the file exists, so this is not an
+    estimate of what an archive might come to but the number of bytes about to
+    be written. _atomic_copy writes a sibling temp file and renames, so the
+    destination volume needs a whole second copy while it runs even when it is
+    replacing a file of the same name.
+
+    Returning True on an unmeasurable volume is deliberate: a network or
+    synthetic filesystem that will not answer statvfs must not become a
+    filesystem the app refuses to save to. The write then fails the honest way,
+    with an error the caller already reports."""
+    try:
+        need = os.path.getsize(src)
+    except OSError:
+        return True
+    real = os.path.realpath(dest)
+    free = free_bytes(os.path.dirname(real) or ".")
+    if free is None or free >= need + DISK_HEADROOM_BYTES:
+        return True
+    if free < need:
+        alert("There is not enough free space to save “%s”.\n\n"
+              "Needed: %s\nFree: %s\n\nNothing was written."
+              % (os.path.basename(dest), human_bytes(need), human_bytes(free)),
+              title="Not Enough Disk Space", level="caution")
+        return False
+    # It fits, but only by eating the reserve macOS wants for swap and caches.
+    # The user's call, with the numbers in front of them.
+    #
+    # Replacing a file gives its bytes back: os.replace drops the old inode, so
+    # the space afterwards is what is left once the OLD copy goes. Reporting the
+    # transient minimum as "after saving" overstated the danger badly - saving
+    # over a same-sized archive reads as losing the whole of it - and could talk
+    # a user out of a save that costs nothing.
+    try:
+        replaced = os.path.getsize(real) if os.path.isfile(real) else 0
+    except OSError:
+        replaced = 0
+    return alert("Saving “%s” would leave very little free space.\n\n"
+                 "This archive is %s.\nFree space after saving: about %s\n\n"
+                 "macOS needs free space for swap files and system caches."
+                 % (os.path.basename(dest), human_bytes(need),
+                    human_bytes(max(free - need + replaced, 0))),
+                 title="Low Disk Space", level="caution",
+                 ok="Save Anyway", cancel="Cancel") == 0
+
+
 def _atomic_copy(src, dest):
     """Copy src onto dest without ever truncating dest in place.
 
@@ -899,6 +1507,9 @@ def save_document():
         set_status("Save failed - no working copy.")
         return False
     if work:
+        if not _space_for_write(work, orig):
+            set_status("Save canceled - not enough free space.")
+            return False
         try:
             _atomic_copy(work, orig)
         except OSError as e:
@@ -929,7 +1540,7 @@ def save_as(dest):
             if os.path.isdir(dest) and not os.path.islink(dest):
                 alert("“%s” is a folder and cannot be replaced. Choose another name."
                       % os.path.basename(dest), title="Cannot Save", level="caution")
-                set_status("Save cancelled - that name is a folder.")
+                set_status("Save canceled - that name is a folder.")
                 return False
             # _atomic_copy follows symlinks, so the file actually replaced may
             # live somewhere else entirely. Name what really gets overwritten.
@@ -940,7 +1551,7 @@ def save_as(dest):
             if alert("“%s” already exists. Do you want to replace it?" % what,
                      title="Replace File", level="caution",
                      ok="Replace", cancel="Cancel") != 0:
-                set_status("Save cancelled")
+                set_status("Save canceled")
                 return False
     # Same guard as save_document, and it matters more here: active_archive()
     # FALLS BACK to the original when the working copy is missing, so a purged
@@ -960,6 +1571,9 @@ def save_as(dest):
         log("save as: no readable source archive (%r)" % src)
         alert("There is nothing to save yet.", level="caution")
         set_status("Save failed - no archive data.")
+        return False
+    if not _space_for_write(src, dest):
+        set_status("Save canceled - not enough free space.")
         return False
     try:
         _atomic_copy(src, dest)
@@ -1001,7 +1615,8 @@ def cleanup():
     d = os.path.join(TMP, "zip-%s" % DOCUMENT_UUID)
     shutil.rmtree(d, ignore_errors=True)
     for k in (PB_WORK, PB_ORIGINAL, PB_DIRTY, PB_PREFIX, PB_SEL_PATH, PB_SEL_ISDIR,
-              PB_ENC, PB_PASSWORD, PB_EX_DEST, PB_EX_MODE, PB_EX_LAST, PB_CLOSE_AFTER_SAVE):
+              PB_ENC, PB_COUNT, PB_PASSWORD, PB_EX_DEST, PB_EX_MODE, PB_EX_LAST,
+              PB_CLOSE_AFTER_SAVE):
         pb_set(k, "")
 
 

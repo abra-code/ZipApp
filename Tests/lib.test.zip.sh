@@ -79,6 +79,13 @@ zip_eval() { # <python-expression> [argument ...]
 
 zip_path_encode() { zip_eval 'path_encode(ARGV[0])' "$1"; }
 
+# The same, in ZIPTOOL's namespace. Its space arithmetic and name matching are
+# rules worth asking about directly rather than through a whole handler; see
+# helpers/ziptool_eval.py for why it is loaded by path.
+ziptool_eval() { # <python-expression> [argument ...]
+    "$OMCTEST_PYTHON" "$TEST_HELPERS/ziptool_eval.py" "$@"
+}
+
 # yes/no for an expression that answers a question. Named for what the caller
 # wants to read, so the check line says the rule rather than the plumbing.
 #
@@ -99,8 +106,15 @@ zip_is() { # <python-expression> [argument ...]
 # A plain "case $2 in $1/*" would not do even for the string version: a command
 # substitution inside a case PATTERN inside another command substitution does
 # not parse in bash 3.2 posix mode.
+# The applet's own interpreter, not /usr/bin/python3: this is a plain stdlib
+# path question with nothing to be independent ABOUT, so there is no reason to
+# reach for the Xcode command-line-tools shim - which is a different Python
+# version, prints a cache-file warning on every call under a sandboxed TMPDIR,
+# and offers to install itself when the tools are absent. zip_oracle below is
+# the one helper that stays on the system interpreter, and its docstring says
+# why: an oracle must not share an implementation with the code under test.
 path_is_inside() { # <parent-dir> <path>
-    /usr/bin/python3 "$TEST_HELPERS/path_is_inside.py" "$1" "$2"
+    "$OMCTEST_PYTHON" "$TEST_HELPERS/path_is_inside.py" "$1" "$2"
 }
 
 # --- An independent oracle for what is really in an archive --------------------
@@ -122,6 +136,14 @@ zip_count() { # <archive> -> how many file entries, or UNREADABLE
 
 zip_has() { # <archive> <entry-name> -> yes, no, or UNREADABLE
     /usr/bin/python3 "$TEST_HELPERS/zip_oracle.py" has "$1" "$2"
+}
+
+# The stored BYTES of one entry. A name and a size cannot settle whether an
+# update really replaced the content - see zip_oracle.entry_bytes - so the
+# assertion that an unreadable update did not overwrite the old entry has to
+# read it back.
+zip_content() { # <archive> <entry-name>
+    /usr/bin/python3 "$TEST_HELPERS/zip_oracle.py" content "$1" "$2"
 }
 
 # For reading, not for asserting - this one IS line-framed.
@@ -154,6 +176,43 @@ make_sample_zip() { # [name, default Sample.zip] -> prints the archive path
     # -r) is what keeps the stored directory records out.
     ( cd "$stage_dir" && /usr/bin/zip -q -X "$archive_path" \
         top.txt docs/readme.txt docs/notes/deep.txt ) || return 1
+    printf '%s' "$archive_path"
+}
+
+# A source FOLDER to compress, which is what the add path actually takes. The
+# unreadable member is the point of the second form: Info-ZIP exits non-zero when
+# it cannot open a file, having stored every other one, and the applet has to
+# report that as the partial result it is rather than as a total failure.
+make_source_tree() { # <name> [unreadable] -> prints the folder path
+    local tree_name="$1"
+    local tree_path="$OMCTEST_WORK/$tree_name"
+    /bin/rm -rf "$tree_path"
+    /bin/mkdir -p "$tree_path/sub"
+    printf 'one\n' > "$tree_path/a.txt"
+    printf 'two\n' > "$tree_path/sub/b.txt"
+    if [ "$2" = "unreadable" ]; then
+        printf 'secret\n' > "$tree_path/locked.txt"
+        /bin/chmod 000 "$tree_path/locked.txt"
+    fi
+    printf '%s' "$tree_path"
+}
+
+# An archive holding one ASCII and one non-ASCII entry name. The pair is the
+# point: level and find narrow on the RAW BYTES before decoding anything, and
+# that shortcut is only exact for ASCII - bytes.lower() folds A-Z and nothing
+# else, so a non-ASCII name has to fall through to the decoded comparison or a
+# real match is silently dropped from the results.
+make_unicode_zip() { # [name, default Unicode.zip] -> prints the archive path
+    local archive_name="${1:-Unicode.zip}"
+    local stage_dir="$OMCTEST_WORK/stage-${archive_name%.zip}"
+    local archive_path="$OMCTEST_WORK/$archive_name"
+    /bin/rm -rf "$stage_dir" "$archive_path"
+    /bin/mkdir -p "$stage_dir"
+    printf 'plain\n' > "$stage_dir/README.txt"
+    # Written through python so the name is exact bytes, not whatever the shell
+    # and the filesystem between them decide to normalize it to.
+    "$OMCTEST_PYTHON" -c "import io,os,sys; open(os.path.join(sys.argv[1], 'R\u00c9SUM\u00c9.txt'), 'w').write('accented\n')" "$stage_dir"
+    ( cd "$stage_dir" && /usr/bin/zip -q -X -r "$archive_path" . ) || return 1
     printf '%s' "$archive_path"
 }
 
@@ -219,8 +278,8 @@ fire_filter() { # <query>
 reset_document() {
     local state_key
     /bin/rm -rf "$(doc_dir)"
-    for state_key in work original dirty prefix sel_path sel_isdir enc password \
-        ex_dest ex_mode ex_last close_after_save; do
+    for state_key in work original dirty prefix sel_path sel_isdir enc count \
+        password ex_dest ex_mode ex_last close_after_save; do
         pb_set "$state_key" ""
     done
 }
@@ -252,7 +311,8 @@ omctest_import_view_ids \
 for omctest_required_id in ID_TABLE ID_ADD_BTN ID_DELETE_BTN ID_EXTRACT_BTN \
     ID_EXTRACT_ALL_BTN ID_UNLOCK ID_ENCRYPT ID_CHANGE_PW \
     ID_REMOVE_ENC ID_UP_BTN ID_BREADCRUMB ID_DET_NAME ID_DET_PATH ID_DET_SIZE \
-    ID_DET_MOD ID_DET_ENC ID_DET_KIND ID_PREVIEW ID_STATUS; do
+    ID_DET_MOD ID_DET_ENC ID_DET_KIND ID_PREVIEW ID_PREVIEW_BUSY ID_STATUS \
+    ID_PROGRESS_BAR ID_PROGRESS_DETAIL; do
     eval "omctest_required_value=\$$omctest_required_id"
     [ -n "$omctest_required_value" ] || {
         printf 'lib.test.zip: %s did not import from lib_zip.py\n' \

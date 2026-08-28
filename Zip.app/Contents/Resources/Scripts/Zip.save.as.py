@@ -26,12 +26,12 @@ if not dest:
         # without saving it somewhere, since OMC cannot call the close off.
         #
         # In practice this branch does not run - OMC aborts the command when the
-        # save panel is cancelled, so the script never starts (verified against
+        # save panel is canceled, so the script never starts (verified against
         # the running applet). It is kept because the OMC docs advise checking
         # for an empty OMC_DLG_SAVE_AS_PATH, so some path may yet deliver one.
         cleanup()
     else:
-        set_status("Save cancelled")
+        set_status("Save canceled")
     sys.exit(0)
 
 ok = save_as(dest)

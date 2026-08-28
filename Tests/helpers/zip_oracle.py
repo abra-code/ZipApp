@@ -3,6 +3,7 @@
     zip_oracle.py count <archive>              -> how many file entries
     zip_oracle.py has   <archive> <entry-name> -> yes or no
     zip_oracle.py names <archive>              -> one entry per line, for eyeballing
+    zip_oracle.py content <archive> <entry>    -> the entry's bytes, or UNREADABLE
 
 Deliberately independent: it uses the SYSTEM python's zipfile, not the applet's
 ziptool and not the applet's embedded interpreter. An assertion about what a
@@ -46,9 +47,29 @@ def stored_files(path):
         return None
 
 
+def entry_bytes(path, name):
+    """The entry's stored CONTENT, or None when it cannot be read.
+
+    Needed because a name and a size do not settle whether an update actually
+    happened: Info-ZIP keeps the existing entry when it cannot read the
+    replacement, and rewrites that entry's header to the new size anyway, so the
+    listing looks exactly like a successful update. Only the bytes tell them
+    apart, and only an oracle outside the applet can be trusted to say so."""
+    try:
+        with zipfile.ZipFile(path) as archive:
+            return archive.read(name)
+    except (OSError, KeyError, RuntimeError, NotImplementedError,
+            zipfile.BadZipFile):
+        # RuntimeError is an encrypted entry and NotImplementedError an
+        # unsupported compression method - both are "cannot be read", not a
+        # reason for the helper to die with a traceback.
+        return None
+
+
 def main(argv):
     if len(argv) < 3:
-        sys.stderr.write("usage: zip_oracle.py count|has|names <archive> [entry-name]\n")
+        sys.stderr.write(
+            "usage: zip_oracle.py count|has|names|content <archive> [entry-name]\n")
         return 2
     action, path = argv[1], argv[2]
     names = stored_files(path)
@@ -60,6 +81,19 @@ def main(argv):
             sys.stderr.write("usage: zip_oracle.py has <archive> <entry-name>\n")
             return 2
         print(UNREADABLE if names is None else ("yes" if argv[3] in names else "no"))
+    elif action == "content":
+        if len(argv) != 4:
+            sys.stderr.write("usage: zip_oracle.py content <archive> <entry>\n")
+            return 2
+        data = entry_bytes(path, argv[3])
+        if data is None:
+            print(UNREADABLE)
+            return 1
+        # Written as bytes: an entry's content is not required to be text, and
+        # decoding it would make the assertion about the decoder.
+        sys.stdout.flush()
+        sys.stdout.buffer.write(data)
+        return 0
     elif action == "names":
         if names is None:
             print(UNREADABLE)

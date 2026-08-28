@@ -262,12 +262,26 @@
                 "properties": { "title": "Preview", "frame": { "maxWidth": "infinity", "maxHeight": "infinity" } },
                 "children": [
                   {
-                    "type": "QuickLook",
-                    "id": 70,
-                    "properties": {
-                      "previewStyle": "compact",
-                      "frame": { "minHeight": 160, "maxWidth": "infinity", "maxHeight": "infinity" }
-                    }
+                    "type": "ZStack",
+                    "properties": { "frame": { "maxWidth": "infinity", "maxHeight": "infinity" } },
+                    "children": [
+                      {
+                        "type": "QuickLook",
+                        "id": 70,
+                        "properties": {
+                          "previewStyle": "compact",
+                          "frame": { "minHeight": 160, "maxWidth": "infinity", "maxHeight": "infinity" }
+                        }
+                      },
+                      {
+                        "type": "ProgressView",
+                        "id": 71,
+                        "properties": {
+                          "progressViewStyle": "circular",
+                          "hidden": true
+                        }
+                      }
+                    ]
                   }
                 ]
               }
@@ -277,15 +291,43 @@
       },
       { "type": "Divider" },
       {
-        "type": "Text",
-        "id": 80,
+        "type": "HStack",
         "properties": {
-          "text": "Open a zip archive to browse its contents.",
-          "font": "footnote",
-          "foregroundStyle": "secondary",
-          "padding": { "top": 5, "leading": 18, "bottom": 5, "trailing": 18 },
-          "frame": { "maxWidth": "infinity", "alignment": "leading" }
-        }
+          "spacing": 12,
+          "padding": { "top": 5, "leading": 18, "bottom": 5, "trailing": 18 }
+        },
+        "children": [
+          {
+            "type": "Text",
+            "id": 80,
+            "properties": {
+              "text": "Open a zip archive to browse its contents.",
+              "font": "footnote",
+              "foregroundStyle": "secondary"
+            }
+          },
+          {
+            "type": "ProgressView",
+            "id": 82,
+            "properties": {
+              "progressViewStyle": "linear",
+              "total": 1,
+              "controlSize": "small",
+              "hidden": true,
+              "frame": { "width": 140 }
+            }
+          },
+          {
+            "type": "Text",
+            "id": 84,
+            "properties": {
+              "text": "",
+              "font": "footnote",
+              "foregroundStyle": "secondary"
+            }
+          },
+          { "type": "Spacer" }
+        ]
       }
     ]
   }
