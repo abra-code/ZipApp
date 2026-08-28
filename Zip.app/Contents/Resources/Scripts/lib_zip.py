@@ -194,13 +194,13 @@ def set_status(msg):
 
 # --- Progress -------------------------------------------------------------
 # The bar lives in the window's status row rather than in a PROGRESS dialog.
-# OMC's PROGRESS panel is the documented mechanism and it does raise a dialog,
-# but on OMC 5.2.0 that dialog never closes: it was still on screen minutes
-# after the task ended, both on a command of ours and on the untouched
-# Zip.extract.run, and a second run stacks a second panel. A three-minute
-# compression that ends by leaving a dead window behind is worse than no
-# progress at all, so the applet drives its own indicator, which it can also
-# retire on every exit path.
+# OMC's PROGRESS panel is the documented mechanism and works; this is a design
+# choice, not a workaround. A document window that is already showing the
+# archive is where the user is looking, and the status row can carry the phase,
+# the counts and the bar as one sentence - where the panel is a separate window
+# that floats over the document for every operation, however small. It also
+# leaves the applet in control of when the indicator goes away, which matters
+# for the phases that have no counter to end on.
 
 
 # One element for every phase, because ActionUI's ProgressView can now be told
