@@ -151,6 +151,7 @@
                       "systemImage": "chevron.up",
                       "buttonStyle": "borderless",
                       "actionID": "Zip.nav.up",
+                      "help": "Go up one folder",
                       "disabled": true
                     }
                   },
