@@ -3,7 +3,9 @@
 # The omctest suites (*.test.sh) run Zip's Python handlers one at a time with stand-in tools; this
 # file launches the applet itself: the launch's own open panel, opening an archive through the
 # main command, and Extract All through its CHOOSE_FOLDER_DIALOG, answered by the test, with the
-# handlers passing the folder along on their per-window pasteboards as a user's run does.
+# handlers passing the folder along on their per-window pasteboards as a user's run does. Save As,
+# a menu bar command for the key window (which a test launch does not have), runs as the window's
+# subcommand (itest_run --window), as its menu item would.
 
 ID_EXTRACT_ALL_BTN=34
 ID_STATUS=80
@@ -71,3 +73,27 @@ itest_wait_idle 60
 check "the chooser was canceled" "true" "$(itest_panel last canceled)"
 check "no files were added anywhere" "4" "$(file_count "$OUT" "$OUT2")"
 check "and the status still reports the last extraction" "Extracted 2 items to $OUT2/sample" "$(itest_value "$window" "$ID_STATUS")"
+
+section "Save As writes a copy where the user chose"
+alerts_reset
+itest_answer_save "$ITEST_WORK/copy.zip"
+itest_run Zip.save.as --window "$window" > /dev/null
+itest_wait_idle 60
+check "a save panel" "save" "$(itest_panel last kind)"
+check "with the command's message" "Save archive as" "$(itest_panel last message)"
+check "the status reports the save" "Saved copy.zip" "$(itest_value "$window" "$ID_STATUS")"
+check "the copy is the archive, byte for byte" "" "$(/usr/bin/cmp "$ARCHIVE" "$ITEST_WORK/copy.zip" 2>&1)"
+check "no alert" "0" "$(alerts_count)"
+
+section "A name without .zip that lands on an existing archive asks first"
+# The save panel checked "keep" for overwriting, not "keep.zip", which Save As appends. The alert's
+# Cancel (rc 1) keeps the file.
+printf 'keep me\n' > "$ITEST_WORK/keep.zip"
+alert_answer 1
+itest_answer_save "$ITEST_WORK/keep"
+itest_run Zip.save.as --window "$window" > /dev/null
+itest_wait_idle 60
+check "one alert" "1" "$(alerts_count)"
+check "asking to replace keep.zip" "1" "$(alerts_mention "keep.zip")"
+check "the status says the save was canceled" "Save canceled" "$(itest_value "$window" "$ID_STATUS")"
+check "and the file is untouched" "keep me" "$(/bin/cat "$ITEST_WORK/keep.zip")"
