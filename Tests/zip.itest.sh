@@ -5,7 +5,8 @@
 # main command, and Extract All through its CHOOSE_FOLDER_DIALOG, answered by the test, with the
 # handlers passing the folder along on their per-window pasteboards as a user's run does. Save As,
 # a menu bar command for the key window (which a test launch does not have), runs as the window's
-# subcommand (itest_run --window), as its menu item would.
+# subcommand (itest_run --window), as its menu item would. Last, the window is closed as its close
+# button would (itest_close), which runs Zip.window.close.
 
 ID_EXTRACT_ALL_BTN=34
 ID_STATUS=80
@@ -97,3 +98,15 @@ check "one alert" "1" "$(alerts_count)"
 check "asking to replace keep.zip" "1" "$(alerts_mention "keep.zip")"
 check "the status says the save was canceled" "Save canceled" "$(itest_value "$window" "$ID_STATUS")"
 check "and the file is untouched" "keep me" "$(/bin/cat "$ITEST_WORK/keep.zip")"
+
+work_dirs() { /bin/ls -d "$ITEST_TMPDIR"zip-* 2>/dev/null | /usr/bin/grep -c .; }
+
+section "Closing the window asks nothing for a saved archive and removes its working files"
+check "the window has its working folder" "1" "$(work_dirs)"
+alerts_reset
+itest_close "$window" > /dev/null
+itest_wait_idle 60
+check "no alert" "0" "$(alerts_count)"
+check "the working folder was removed" "0" "$(work_dirs)"
+check_contains "and the window is closed" "-32602" "$(itest_close "$window" 2>&1)"
+check "the archives are untouched" "" "$(/usr/bin/cmp "$ARCHIVE" "$ITEST_WORK/copy.zip" 2>&1)"
