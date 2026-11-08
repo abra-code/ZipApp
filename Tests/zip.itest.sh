@@ -27,9 +27,7 @@ file_count() { /usr/bin/find "$@" -type f | /usr/bin/wc -l | /usr/bin/tr -d ' ';
 section "A launch with no document asks for one; a cancel opens nothing"
 # The panel comes before the test can queue an answer, so it is the one a user dismisses. The
 # engine then runs nothing (OMCCommandRunner: a canceled open panel is userCanceledErr), so no
-# window opens. Zip.main.py's docstring says a canceled blank launch opens a new untitled archive,
-# but its new_archive() branch needs the main command to run with no object, and with
-# act_file_or_folder and OPEN_OBJECT_DIALOG it never does through the menu or a launch.
+# window opens; a new untitled archive is File > New (Zip.new), as Zip.main.py's docstring says.
 check "the launch showed the main command's open panel" "Choose a zip archive to open" "$(itest_panel 1 message)"
 check "for zip archives" "public.zip-archive com.pkware.zip-archive" "$(itest_panel 1 allowedContentTypes | /usr/bin/tr '\n' ' ' | /usr/bin/sed 's/ $//')"
 check "canceled, as no answer was queued" "true" "$(itest_panel 1 canceled)"
